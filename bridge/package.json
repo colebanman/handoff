@@ -1,0 +1,20 @@
+{
+  "name": "handoff-bridge",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Local daemon bridging coding agents (Claude Code, Cursor) to the Handoff Chrome extension agent. Zero runtime dependencies.",
+  "bin": {
+    "handoff-bridge": "./handoff-bridge.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "handoff-bridge.mjs",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT"
+}

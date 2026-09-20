@@ -1,0 +1,28 @@
+/* Thinking shimmer for the sidebar. */
+.shine {
+  background-image: linear-gradient(
+    100deg,
+    rgb(var(--fg) / 0.42) 0%,
+    rgb(var(--fg) / 0.98) 50%,
+    rgb(var(--fg) / 0.42) 100%
+  );
+  background-clip: text;
+  -webkit-background-clip: text;
+  background-size: 220% 100%;
+  -webkit-text-fill-color: transparent;
+  animation: shine 1.8s linear infinite;
+  /* Own compositor layer: the sweep repaints only this text, not the row/feed. */
+  will-change: background-position;
+  transform: translateZ(0);
+}
+
+@keyframes shine {
+  0% {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) { .shine { animation: none; background-image: none; -webkit-text-fill-color: currentColor; } }

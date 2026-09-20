@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>handoff stream inspector</title>
+    <!-- Self-contained styles on purpose: this page must not import the app's
+         theme.css (it is a debug tool, not part of the product surface) and must
+         stay cheap with thousands of rows in the DOM — no shadows, no
+         transitions on rows, no layout that depends on sibling count. -->
+    <style>
+      :root {
+        --bg: #0e0f12;
+        --panel: #16181d;
+        --stroke: #24272e;
+        --text: #d7dae0;
+        --dim: #868d99;
+        --accent: #599ce7;
+        --request: #e0a458;
+        --raw: #5fb98a;
+        --part: #599ce7;
+        --meta: #a88cd8;
+        --log: #8b98a8;
+        --danger: #e06c75;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        background: var(--bg);
+        color: var(--text);
+        font:
+          13px/1.4 ui-sans-serif,
+          system-ui,
+          -apple-system,
+          sans-serif;
+      }
+      header {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 10px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--stroke);
+      }
+      button {
+        padding: 4px 10px;
+        color: var(--text);
+        background: #1e2128;
+        border: 1px solid var(--stroke);
+        border-radius: 5px;
+        font: inherit;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #262a33;
+      }
+      button.on {
+        color: #0e0f12;
+        background: var(--accent);
+        border-color: var(--accent);
+      }
+      button.off {
+        color: var(--danger);
+        border-color: #3a2b2e;
+      }
+      input[type='text'] {
+        flex: 1 1 160px;
+        min-width: 120px;
+        padding: 4px 8px;
+        color: var(--text);
+        background: #1e2128;
+        border: 1px solid var(--stroke);
+        border-radius: 5px;
+        font: inherit;
+      }
+      .filters {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      .filters label {
+        display: flex;
+        gap: 4px;
+        align-items: center;
+        color: var(--dim);
+        cursor: pointer;
+      }
+      .filters input {
+        margin: 0;
+      }
+      .sep {
+        width: 1px;
+        height: 18px;
+        background: var(--stroke);
+      }
+      #counts {
+        margin-left: auto;
+        color: var(--dim);
+        font-variant-numeric: tabular-nums;
+      }
+      #list {
+        flex: 1;
+        overflow: auto;
+        padding: 4px 0 40px;
+        overflow-anchor: none;
+      }
+      .row {
+        padding: 3px 10px;
+        border-bottom: 1px solid #14161b;
+      }
+      .head {
+        display: flex;
+        gap: 8px;
+        align-items: baseline;
+        font-variant-numeric: tabular-nums;
+      }
+      .seq,
+      .ts,
+      .delta {
+        color: var(--dim);
+        font-size: 11px;
+      }
+      .delta.slow {
+        color: var(--request);
+      }
+      .kind {
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      .row--request .kind {
+        color: var(--request);
+      }
+      .row--raw .kind {
+        color: var(--raw);
+      }
+      .row--part .kind {
+        color: var(--part);
+      }
+      .row--meta .kind {
+        color: var(--meta);
+      }
+      .row--log .kind {
+        color: var(--log);
+      }
+      .label {
+        overflow: hidden;
+        color: var(--text);
+        font-weight: 600;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+      }
+      .bytes {
+        color: var(--dim);
+        font-size: 11px;
+      }
+      pre.body {
+        margin: 2px 0 0;
+        color: #b9c0cc;
+        font:
+          12px/1.45 ui-monospace,
+          'SF Mono',
+          Menlo,
+          monospace;
+        white-space: pre-wrap;
+        word-break: break-word;
+        cursor: pointer;
+      }
+      pre.body.clip {
+        max-height: 4.4em;
+        overflow: hidden;
+        mask-image: linear-gradient(#000 60%, transparent);
+      }
+      pre.body.clip::after {
+        content: '';
+      }
+      .empty {
+        padding: 24px 12px;
+        color: var(--dim);
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <button id="arm" type="button">Arm</button>
+      <button id="pause" type="button">Pause</button>
+      <span class="sep"></span>
+      <div class="filters">
+        <label><input type="checkbox" data-kind="request" checked />request</label>
+        <label><input type="checkbox" data-kind="raw" checked />raw</label>
+        <label><input type="checkbox" data-kind="part" checked />part</label>
+        <label><input type="checkbox" data-kind="meta" checked />meta</label>
+        <label><input type="checkbox" data-kind="log" checked />log</label>
+      </div>
+      <input id="find" type="text" placeholder="filter substring (label or payload)" spellcheck="false" />
+      <button id="copy" type="button">Copy all</button>
+      <button id="clear" type="button">Clear</button>
+      <span id="counts">0 entries · 0 B</span>
+    </header>
+    <div id="list"><div class="empty">Waiting for traffic. Send a message in the side panel.</div></div>
+    <script type="module" src="/src/stream-debug/main.ts"></script>
+  </body>
+</html>

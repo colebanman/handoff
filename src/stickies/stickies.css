@@ -1,0 +1,54 @@
+:host { all: initial; color-scheme: light; }
+*, *::before, *::after { box-sizing: border-box; }
+button, textarea, input { font: inherit; color: inherit; letter-spacing: inherit; }
+button { cursor: pointer; border: 0; background: transparent; display: inline-flex; align-items: center; justify-content: center; padding: 6px; border-radius: 10px; transition: background 120ms, color 120ms; }
+button:hover { background: #55657c12; }
+button:active { background: #55657c20; }
+button:disabled { opacity: .38; cursor: default; }
+button:focus-visible, a:focus-visible, [tabindex]:focus-visible { outline: 2px solid #7777c7; outline-offset: 3px; }
+button svg { width: 17px; height: 17px; display: block; }
+.glass { background: linear-gradient(145deg, #ffffffb8, #f4f5fc80 60%, #e8effca3); backdrop-filter: blur(28px) saturate(155%); -webkit-backdrop-filter: blur(28px) saturate(155%); border: 1px solid #ffffffc9; box-shadow: 0 12px 44px #2731471c, 0 2px 8px #26334a0a, inset 0 1px 0 #ffffffee, inset 0 -1px 0 #ffffff60; }
+/* ---- stickies: collaborative page notes ---- */
+.stickies { position: fixed; z-index: 2147483645; display: flex; flex-direction: column; gap: 10px; width: min(300px, calc(100vw - 32px)); max-height: calc(100dvh - 120px); pointer-events: none; color: #29313d; font: 400 13px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; letter-spacing: -.01em; }
+.stickies--top-left { top: 16px; left: 16px; } .stickies--top-right { top: 16px; right: 16px; }
+.stickies--bottom-left { bottom: 84px; left: 16px; flex-direction: column-reverse; } .stickies--bottom-right { bottom: 84px; right: 16px; flex-direction: column-reverse; }
+/* Pinned cards are placed by the overlay (element/point pins); left+top come from inline styles. */
+.stickies--pinned { max-height: min(60dvh, 520px); }
+.sticky { pointer-events: auto; border-radius: 16px; overflow: hidden; display: flex; flex-direction: column; max-height: min(60dvh, 520px); transition: box-shadow 160ms, transform 0ms; }
+.sticky--dragging { box-shadow: 0 22px 60px #27314733, 0 2px 8px #26334a14; cursor: grabbing; user-select: none; }
+.sticky--collapsed { max-height: none; }
+.sticky-head { display: flex; align-items: center; gap: 4px; padding: 6px 6px 6px 8px; cursor: grab; touch-action: none; user-select: none; }
+.sticky--dragging .sticky-head { cursor: grabbing; }
+.sticky-grip { display: inline-flex; color: #8f97a7; } .sticky-grip svg { width: 14px; height: 14px; }
+.sticky-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; color: #3a4354; }
+.sticky-btn { width: 26px; height: 26px; padding: 0; border-radius: 8px; color: #6b7484; opacity: .7; }
+.sticky-btn:hover { opacity: 1; } .sticky-btn svg { width: 14px; height: 14px; }
+.sticky-chevron { display: inline-flex; transition: transform 200ms cubic-bezier(.2,.8,.2,1); } .sticky-chevron.is-collapsed { transform: rotate(-90deg); }
+.sticky-body { padding: 0 14px 12px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
+.sticky-body > :first-child { margin-top: 2px; } .sticky-body > :last-child { margin-bottom: 0; }
+.sticky-body p { margin: 0 0 8px; } .sticky-body h1, .sticky-body h2, .sticky-body h3 { margin: 8px 0 6px; font-size: 13px; font-weight: 650; }
+.sticky-body ul, .sticky-body ol { padding-left: 20px; margin: 0 0 8px; } .sticky-body li { margin: 3px 0; }
+/* Task items keep normal inline flow — flex would split each <strong>/<a>/text run into its own column — with the box pulled into the gutter. */
+.sticky-body li:has(> .sticky-check), .sticky-body li:has(> p:first-child > .sticky-check:first-child) { list-style: none; margin-left: -20px; padding-left: 23px; position: relative; }
+.sticky-body li p { margin: 0 0 4px; } .sticky-body li > p:last-child { margin-bottom: 0; }
+.sticky-body li:has(> .sticky-check:checked), .sticky-body li:has(> p:first-child > .sticky-check:first-child:checked) { color: #8a92a2; text-decoration: line-through; text-decoration-color: #b4bac9; }
+.sticky-check { appearance: none; position: absolute; left: 0; top: .28em; width: 15px; height: 15px; border-radius: 5px; border: 1.5px solid #9aa3b5; background: #ffffffa0; cursor: pointer; transition: background 140ms, border-color 140ms, transform 120ms; }
+.sticky-check:hover { border-color: #6f78a8; } .sticky-check:active { transform: scale(.92); }
+.sticky-check:checked { background: #6f78c8; border-color: #6f78c8; }
+.sticky-check:checked::after { content: ''; position: absolute; left: 4px; top: 1px; width: 4px; height: 8px; border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg); }
+.sticky-body code { font-size: 11.5px; background: #eef0f59e; padding: 1px 4px; border-radius: 4px; }
+.sticky-empty { color: #8a92a2; font-style: italic; }
+.sticky-editor { display: flex; flex-direction: column; padding: 0 8px 8px; gap: 6px; }
+.sticky-editor textarea { width: 100%; min-height: 140px; max-height: 40dvh; resize: vertical; border: 1px solid #b1b8cb60; border-radius: 10px; background: #fff9; padding: 8px 10px; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; outline: none; }
+.sticky-editor textarea:focus { border-color: #8b8fbe; }
+.sticky-editor-row { display: flex; align-items: center; gap: 4px; font-size: 10px; color: #7a8190; } .sticky-editor-row > span { flex: 1; padding-left: 4px; }
+.sticky-editor-row .sticky-btn { width: auto; height: 26px; padding: 0 9px; gap: 4px; font-size: 11px; opacity: 1; }
+.sticky-btn--primary { background: #374153; color: #fff; } .sticky-btn--primary:hover { background: #505c74; }
+.sticky-notice { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); pointer-events: auto; padding: 7px 12px; border-radius: 12px; font-size: 11px; color: #5b6473; z-index: 2147483645; }
+@media (max-width: 520px) { .stickies { width: calc(100vw - 24px); } .stickies--top-left, .stickies--bottom-left { left: 12px; } .stickies--top-right, .stickies--bottom-right { right: 12px; } }
+
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) { .glass { background: #f7f8fc; backdrop-filter: none; border-color: #8a94a8; } }
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) { .glass { background: #f3f5fa; } }
+:host([data-sticky-snapshot]) { visibility: hidden !important; }
+:host([data-sticky-automation]) * { pointer-events: none !important; }

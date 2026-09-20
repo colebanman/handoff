@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-label="Handoff logo">
+  <rect width="128" height="128" rx="28" fill="#245EEA"/>
+  <rect x="28" y="30" width="13" height="68" rx="6.5" fill="#FFFFFF"/>
+  <rect x="87" y="30" width="13" height="68" rx="6.5" fill="#FFFFFF"/>
+  <path d="M 39 43 L 70 43 L 70 34 L 89 51 L 70 68 L 70 59 L 39 59 Z" fill="#FFFFFF"/>
+  <path d="M 89 69 L 58 69 L 58 60 L 39 77 L 58 94 L 58 85 L 89 85 Z" fill="#FFFFFF"/>
+</svg>

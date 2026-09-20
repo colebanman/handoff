@@ -1,0 +1,73 @@
+{
+  "manifest_version": 3,
+  "name": "Handoff",
+  "version": "0.2.0",
+  "description": "Hand off work to an AI assistant that works in your browser, with files, reusable workflows, and a local agent bridge.",
+  "minimum_chrome_version": "120",
+  "action": {
+    "default_title": "Open Handoff",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "alarms",
+    "debugger",
+    "tabs",
+    "tabGroups",
+    "history",
+    "bookmarks",
+    "storage",
+    "unlimitedStorage",
+    "sidePanel",
+    "scripting",
+    "downloads",
+    "activeTab",
+    "notifications",
+    "contextMenus",
+    "webNavigation",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "sandbox": {
+    "pages": [
+      "sandbox.html",
+      "artifact-frame.html"
+    ]
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'",
+    "sandbox": "sandbox allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox; script-src 'self' 'unsafe-inline' 'unsafe-eval'; object-src 'self'"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "file:///*"
+      ],
+      "js": [
+        "stickies.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
+}
