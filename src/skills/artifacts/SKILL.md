@@ -1,125 +1,142 @@
 ---
 name: artifacts
-version: 1
-description: How to build HTML artifacts with the bundled artifact kit (design system + <ai-*> components), load live data, and verify them before presenting.
+version: 3
+description: How to build HTML artifacts with the bundled artifact kit — markdown-first <ai-doc>, ::: directives, <ai-*> components, live data, and verification before presenting.
 ---
 
 # Artifacts — the kit
 
-Every `.html` artifact you write is rendered with the **artifact kit** injected: a stylesheet (shadcn-style tokens and classes) and a set of `<ai-*>` web components. You never include the kit yourself. Compose it; do not restyle it. Your job is data and structure, not CSS.
+Every `.html` artifact loads the **artifact kit**: shadcn-style CSS plus `<ai-*>` components. Never include, restyle, or re-theme it. Your job is content and structure, not CSS. No `<style>`, no `style=`, no forced `data-theme`, no hand-built card/badge markup: the kit already has them, and they look better and cost fewer tokens.
 
-Theme follows the side panel (dark by default). Never hard-code colors; use tokens (`var(--brand)`, `var(--muted-foreground)`, `var(--border)`) if you must style something custom.
-
-## Starter template
+**Write markdown, not HTML.** Kit markdown turns into polished components (tables, callouts, cards, steps, checklists, sources). A file can be only this (no `<html>`/`<head>` boilerplate needed):
 
 ```html
-<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>Week of Sep 14</title></head>
-<body>
-<ai-app title="Week of Sep 14" subtitle="Canvas · 4 courses" updated="2026-09-11T15:00:00Z">
-  <div slot="actions">
-    <button class="btn btn-outline btn-sm" id="refresh">Refresh</button>
-  </div>
+<ai-doc subtitle="COURSE 101 · working draft" updated="2026-09-30T22:22:00Z" accent="violet">
+# Capital One — three responses
 
-  <div class="grid cols-3">
-    <ai-stat label="Due this week" value="7"></ai-stat>
-    <ai-stat label="Overdue" value="1" trend="down"></ai-stat>
-    <ai-stat label="Submitted" value="12" delta="+3"></ai-stat>
-  </div>
+::: details How the feedback shaped this draft
+- **Credit Suisse feedback:** keep case evidence and tables.
+:::
 
-  <ai-calendar id="cal" view="week"></ai-calendar>
+## 1. Scientific testing
+| Stage | Application |
+|-|-|
+| Hypothesis | Predict which rates/fees appeal to a segment. |
 
-  <div class="card">
-    <div class="card-header"><div><div class="card-title">Assignments</div><div class="card-description">Sorted by due date</div></div></div>
-    <div class="card-content card-flush"><ai-table id="table" sortable empty="No assignments found."></ai-table></div>
-  </div>
-</ai-app>
+::: note Customer intimacy
+Testing raises lifetime value, not just sign-ups.
+:::
 
-<script>
-  const assignments = [/* data you fetched in your turn, or fetch here with ai.fetch */]
-  const table = document.getElementById('table')
-  table.columns = [
-    { key: 'course', label: 'Course' },
-    { key: 'name', label: 'Assignment', type: 'link', hrefKey: 'url' },
-    { key: 'due', label: 'Due', type: 'datetime' },
-    { key: 'status', label: 'Status', type: 'badge' },
-  ]
-  table.rows = assignments
-  document.getElementById('cal').events = assignments.map(a => ({ start: a.due, title: a.name, subtitle: a.course, href: a.url }))
-  document.getElementById('refresh').onclick = () => ai.invoke('Refresh this week view from Canvas and update the artifact in place.')
-</script>
-</body>
-</html>
+- [ ] Paste answers into the Word doc
+- [ ] Add AI-use citation
+
+::: sources
+- [Capital One case](https://docs.google.com/…)
+:::
+</ai-doc>
 ```
 
-Rules of thumb: one `<ai-app>` per page; stats in a `.grid`; tables inside a `.card` with `card-flush`; keep source URLs and a retrieval time (`updated=`) visible.
+`<ai-doc>` = page header + reading column + automatic "On this page" nav when there are 3+ `##` sections. A leading `# Title` becomes the page title. Attributes: `title`, `subtitle` (inline markdown), `updated` (ISO), `accent`, `width` (`narrow`/`default`/`wide`/`full`), `toc="off"`, `src` (VFS .md path). Children with `slot="actions"` go in the header.
 
-## Layout & primitives (classes)
+For dashboards and apps, use `<ai-app title subtitle updated accent width>` and put `<ai-markdown>` blocks, `<ai-*>` components, and your own `<script>` inside it.
 
-- Layout: `.container` (inside `<ai-app>` already), `.stack` / `.stack-sm` / `.stack-lg`, `.row` / `.row-between` / `.row-end`, `.grow`, `.grid` (+ `.cols-2/3/4`, collapses on narrow screens).
-- Surfaces: `.card` > `.card-header` (`.card-title`, `.card-description`) + `.card-content` + `.card-footer`; `.card-flush` removes content padding (for tables/lists).
-- Controls: `.btn` (+ `.btn-secondary`, `.btn-outline`, `.btn-ghost`, `.btn-brand`, `.btn-destructive`, `.btn-sm`, `.btn-lg`, `.btn-icon`), `.input`, `.select`, `.textarea`, `.label`, `.checkbox`.
-- Signals: `.badge` (+ `-outline`, `-brand`, `-success`, `-warning`, `-destructive`), `.alert` (+ `-info`, `-success`, `-warning`, `-destructive`, with `.alert-title`), `.progress > span`, `.skeleton`, `.kbd`.
-- Data: `.table-wrap > table.table` (`.num` for numeric cells, `.table-dense`), `.list > .list-item` (`.list-item-body`, `-title`, `-subtitle`, `-meta`), `dl.kv`, `.stat`.
-- Text: `.h1`–`.h4`, `.muted`, `.text-xs/.text-sm/.text-lg`, `.mono`, `.truncate`, `.separator`.
+## Pick a shape (don't make every artifact a stack of cards)
 
-## Components (`<ai-*>`)
+| Content | Shape |
+|-|-|
+| Draft, notes, brief, study guide, review | `<ai-doc>` with `##` sections, tables, callouts, `::: details`/`::: accordion` for supporting material, `::: sources` last |
+| Dashboard or status | `<ai-app>` → `::: stats` row, then a `::: grid 2` of cards (bars, timeline, lists), then a table |
+| Plan, itinerary, or process | `::: timeline` (times/dates) or `::: steps` (ordered actions), task lists for things to tick off |
+| Listings (jobs, options, products) | `::: cards` (one `###` per item) or a `::: table {sortable filter}` when there are more than ~8 items |
+| Comparison or decision | a table with the options as columns, a `::: tip` stating the recommendation, and the reasoning in `::: details` |
+| Practice or Q&A | `::: accordion`, one `###` per question and the answer as its body |
 
-All render into light DOM (inspectable with `document.querySelector(...)` from `api.artifacts.eval`). Data goes in via **properties** (`el.rows = [...]`) or **JSON attributes** (`rows='[...]'`). Setting a property re-renders.
+Lead with the answer (a summary callout or stats), then detail. Use one or two component types per section. Leave plain prose as prose, and don't wrap a single paragraph in a card. Pick an `accent` that fits the subject (`blue` default, `violet`, `green`, `amber`, `rose`, `teal`, `orange`, `slate`) so artifacts don't all look the same.
 
-| Element | Attributes | Properties / events |
-|-|-|-|
-| `<ai-app>` | `title`, `subtitle`, `updated` (ISO), `width` = `narrow`/`default`/`wide`/`full` | children = page content; `slot="actions"` child = header buttons |
-| `<ai-stat>` | `label`, `value`, `delta` ("+3"), `hint`, `trend` = `up`/`down` | — |
-| `<ai-table>` | `sortable`, `dense`, `empty`, `caption`, `columns`, `rows` | `columns: [{ key, label, type?: 'date'|'datetime'|'number'|'badge'|'link', align?: 'right', width?, hrefKey?, variant?, format?, render?(row) → string|Node }]`, `rows: object[]`, `onRowClick(row)`; event `row-click` |
-| `<ai-list>` | `items`, `empty` | `items: [{ title, subtitle?, meta?, badge?, badgeVariant?, href?, initials? }]`, `onItemClick(item)`; event `item-click` |
-| `<ai-kv>` | `items` | `items: [{ label, value }]` or `{ label: value }` |
-| `<ai-tabs>` + `<ai-tab label name>` | `active` (tab name) | event `tab-change` |
-| `<ai-calendar>` | `view` = `week`/`month`, `date` (anchor), `week-start` = `mon`/`sun`, `events` | `events: [{ start (ISO), end?, title, subtitle?, href?, color?, allDay? }]`, `onEventClick(ev)`; event `event-click`; has prev/today/next + view toggle |
-| `<ai-live>` | `every` ("10m"), `label`, `src` (URL fetched with `ai.fetch`, JSON parsed) | `load = async (body, el) => string|Node|void` (fills `el.body`), `render = (data, body) => …` for `src`; `refresh()`; events `refreshed`, `data`. Shows "Updated 2m ago" + Refresh. Minimum 1 minute. |
-| `<ai-markdown>` | `src` (VFS path) or inline text | `text` property. Headings, lists, tasks, tables, code, links. |
-| `<ai-image>` | `src` (VFS path or URL), `alt`, `height`, `fit` | VFS paths resolve through `ai.fs.dataUrl` |
-| `<ai-empty>` | `title`, `description` | children = action buttons |
-| `<ai-alert>` | `variant`, `title` | children = message |
-| `<ai-skeleton>` | `lines`, `height` | placeholder while loading |
-| `<ai-progress>` | `value`, `max` | — |
-| `<ai-badge>` | `variant` | children = text |
+## Kit markdown
 
-Helpers on `ai.ui` (also `window.AiKit`): `h(tag, attrs, ...children)`, `esc(text)`, `fmtDate`, `fmtTime`, `fmtDateTime`, `fmtNumber`, `timeAgo(ms)`, `markdown(text)`, `open(href)`.
+Standard GFM works: headings, **bold**/*italic*/~~strike~~/`code`, links, images (VFS paths too), nested lists, `> quotes`, fenced code (gets a copy button), `---`, and tables. Tables accept `|-|` separators and `:-:`/`-:` alignment, and numeric columns right-align on their own. Lines that start with an HTML tag pass through, so `<ai-calendar id="cal"></ai-calendar>` can sit between markdown blocks.
 
-## Data loading pattern
+- `- [ ] task` / `- [x] done`: real checkboxes, **saved per artifact automatically** (event `task-change`). Don't hand-roll checklist state.
+- Inline: `:badge[Overdue]` (tone is inferred from the wording: done/submitted → green, pending/draft/in progress → amber, overdue/missing/blocked → red, new/upcoming/scheduled → accent), `:badge-success[…]`/`-warning`/`-destructive`/`-brand`/`-outline`/`-muted` to force a tone, `:kbd[⌘K]`, `:icon[calendar]`, `==highlight==`.
+- `> [!NOTE]`, `> [!TIP]`, `> [!IMPORTANT]`, `> [!WARNING]`, `> [!CAUTION]` (optional title after the tag).
 
-Static snapshot (most artifacts): fetch and shape data in **your** turn, embed it as a JS literal, set `updated=`. Reliable, testable, no runtime failures for the user.
+### Directives
 
-Live data (feeds, inbox, announcements): use `<ai-live>` so the page refreshes itself:
+`::: name args {flags}` … `:::`. They nest; each bare `:::` closes the innermost one.
+
+| Directive | Body → result |
+|-|-|
+| `note`/`info`, `tip`/`success`, `important`, `warning`, `danger` + optional title | callout with an icon |
+| `card Title \| description {flush tone=success icon=calendar}` | card with a markdown body |
+| `details Summary {open}` / `reveal [label]` | collapsible section (`reveal` defaults to "Reveal answer") |
+| `accordion {open}` | one collapsible per `###` heading |
+| `cards [cols]` | one card per `###` heading; the heading can be a link. Use it for listings |
+| `grid [2-4]` | nested directives side by side (any loose markdown becomes its own cell) |
+| `tabs` | one tab per `##`/`###` heading |
+| `stats [cols] {invert}` | lines `Label \| Value \| delta \| hint`. A delta starting with +/- colors itself; `invert` means down is good |
+| `bars {max=100 tone=success}` | lines `Label \| value \| note`, where the value is `18/20`, `72%`, or a number |
+| `steps` | list items or `###` sections. `**Title** — text` becomes the step title; `[x]` marks the step done |
+| `timeline` | list items like `- **9:50 AM** Lecture — room 300`, or `###` headings as the time labels |
+| `kv` | lines `Label: value` → a definition list |
+| `table [caption] {sortable filter dense}` | a pipe table becomes an interactive `<ai-table>` (sort, search box) |
+| `sources [title]` | a muted footer; each link gets its host chip |
+
+## Components (for data you set from JS)
+
+All render into light DOM. Data goes in via **properties** (`el.rows = [...]`) or JSON attributes.
+
+| Element | Use |
+|-|-|
+| `<ai-table sortable filter dense empty columns rows>` | `columns` = compact spec `"Course, name=Assignment:link(url), due=Due:datetime, Status:badge, Pts:number"` (types: `date` `datetime` `number` `badge` `link(hrefKey)`, default = inline markdown), or objects `{ key, label, type, align, render(row) }`. `rows` = objects, or **arrays** (no repeated keys; with no `columns`, the first row is the header). A pipe table as children also works. `badge` cells infer their tone; `variant: {Late: 'destructive'}` overrides. `onRowClick(row)` |
+| `<ai-card title description icon href tone collapsible open flush>` | card; text-only children render as markdown; `slot="actions"`/`slot="footer"` |
+| `<ai-stat label value delta hint icon trend>` | one metric |
+| `<ai-list items>` | `[{ title, subtitle?, meta?, badge?, badgeVariant?, href?, initials? }]` |
+| `<ai-calendar view=week\|month date events>` | `events: [{ start, end?, title, subtitle?, href?, color?, allDay? }]` |
+| `<ai-live every="15m" label src>` | self-refreshing section: `el.load = async (body) => Node\|string` |
+| `<ai-markdown src>` / `el.text = md` | kit markdown anywhere |
+| `<ai-alert variant title>` | callout (`info` `success` `warning` `destructive` `brand`); text children are markdown |
+| `<ai-tabs>` + `<ai-tab label name>`, `<ai-kv items>`, `<ai-image src>`, `<ai-empty title description>`, `<ai-skeleton lines>`, `<ai-progress value max>`, `<ai-badge variant>`, `<ai-icon name>` | as named |
+
+Icons (`:icon[x]`, `icon=`): info, alert-triangle, circle-check, circle-x, lightbulb, sparkles, check, x, plus, chevron-right, chevron-down, arrow-right, external-link, link, copy, clock, calendar, map-pin, user, users, mail, file-text, book, graduation-cap, briefcase, dollar, trending-up, trending-down, target, flag, star, zap, search, refresh, list, check-square, home, plane, shopping-cart, code, message-square, heart, lock.
+
+Classes, when you need raw HTML: `.stack`/`.row`/`.grid .cols-2..4`, `.card`/`.card-header`/`.card-title`/`.card-content`, `.btn` (`-outline` `-ghost` `-secondary` `-brand` `-destructive` `-sm`), `.input`, `.badge-*`, `.muted`, `.text-sm`, `.mono`. Helpers: `ai.ui.h(tag, attrs, ...children)`, `esc`, `markdown(text)`, `inline(text)`, `icon(name)`, `tone(text)`, `fmtDate`, `fmtDateTime`, `fmtNumber`, `timeAgo`.
+
+## Token discipline
+
+- Prose and tables go in markdown. Never build `<div class="card"><div class="card-header">…` chains or `<span class="badge">` by hand.
+- Data tables: array rows plus a column spec string. Put constant values (source, retrieval note) in a caption or subtitle once, not in every row.
+- Put repeated items (jobs, problems, edits) in `::: cards` / `::: accordion` / a table. Never write the same HTML shape 20 times, and never keep content in both HTML and a JS array.
+- To copy a snippet, use a fenced code block; the copy button comes free.
+
+## Data loading
+
+Static snapshot (most artifacts): fetch and shape the data in **your** turn, embed it, set `updated=`. Live data (feeds, inbox): `<ai-live>` with `ai.fetch`. Judgment work (summaries, drafting, browsing) goes behind a button that calls `ai.invoke(prompt)`, never on load or on a timer. Persist edits with `ai.autosave()` / `ai.state` (task lists already persist).
 
 ```html
-<ai-live id="ann" every="15m" label="Announcements"><ai-skeleton lines="4"></ai-skeleton></ai-live>
+<ai-app title="Announcements" accent="teal">
+<ai-live id="ann" every="15m" label="Canvas"><ai-skeleton lines="4"></ai-skeleton></ai-live>
+</ai-app>
 <script>
-  document.getElementById('ann').load = async (body) => {
-    const res = await ai.fetch('https://school.instructure.com/api/v1/announcements?context_codes[]=course_123&per_page=20')
+  document.getElementById('ann').load = async () => {
+    const res = await ai.fetch('https://school.instructure.com/api/v1/announcements?context_codes[]=course_123')
     if (!res.ok) throw new Error('Canvas ' + res.status)
-    const items = JSON.parse(res.text).map(a => ({ title: a.title, subtitle: a.context_name, meta: ai.ui.fmtDate(a.posted_at), href: a.html_url }))
-    const list = ai.ui.h('ai-list', { empty: 'No announcements.' })
-    list.items = items
-    return list
+    const t = ai.ui.h('ai-table', { sortable: true, filter: 'Search announcements' })
+    t.columns = 'Title:link(3), Course, Posted:date'
+    t.rows = JSON.parse(res.text).map(a => [a.title, a.context_name, a.posted_at, a.html_url])
+    return t
   }
 </script>
 ```
 
-Judgment work (summaries, drafting, browsing) belongs behind a button that calls `ai.invoke(prompt)`; never call `ai.invoke` on load or on a timer.
-
-Persist user edits with `ai.autosave()` (checklists, notes) and per-artifact values with `ai.state`.
-
 ## Before presenting
 
-1. `api.artifacts.reset(path)` — first-open state.
-2. `api.artifacts.eval(path, "await ai.waitFor(() => document.querySelectorAll('ai-table tbody tr').length > 0, { timeoutMs: 15000 }); return document.body.innerText.slice(0, 1200)")` — real content, no `undefined`/`NaN`/`[object Object]`.
-3. `api.artifacts.logs(path)` empty of errors; `api.artifacts.trace(path)` shows expected calls with 2xx.
-4. `filesystem_view(path)` — layout, overflow, empty states.
+1. `api.artifacts.reload(path)` to verify the saved document without clearing durable state. Never reset an existing artifact during verification: reset deletes saved checkboxes/preferences. If first-open behavior needs testing, use a disposable copy at a different path.
+2. `api.artifacts.eval(path, "await ai.waitFor(() => document.querySelector('.md, ai-table tbody tr'), { timeoutMs: 15000 }); return document.body.innerText.slice(0, 1200)")`: real content, with no `undefined`/`NaN`/`[object Object]` and no leftover `:::` or `|` lines (either one means a directive or table didn't parse).
+3. `api.artifacts.logs(path)` has no errors (an unknown `:::` name logs a warning). `api.artifacts.trace(path)` shows the expected calls returning 2xx.
+4. `filesystem_view(path)`: check hierarchy, spacing, overflow, and empty states.
 5. Link it once: `[Week view](/workspace/artifacts/week.html)`.
 
 ## Custom visuals
 
-Whiteboards, diagrams, charts: keep `<ai-app>` for the frame and put your SVG/canvas inside a `.card`. Charting via CDN (`<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>`) works — the viewer inlines it. Read colors from tokens (`getComputedStyle(document.documentElement).getPropertyValue('--brand')`). Opt out of the kit entirely only for full-bleed custom pages: `<meta name="artifact-kit" content="off">`.
+Charts, diagrams, whiteboards: keep `<ai-app>` as the frame and put the SVG/canvas in a `.card`. Chart libraries via CDN (`<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>`) are inlined for you. Read colors from tokens (`getComputedStyle(document.documentElement).getPropertyValue('--brand')`). For simple comparisons, prefer `::: bars` over a chart library. Opt out of the kit only for full-bleed custom pages: `<meta name="artifact-kit" content="off">`.

@@ -7,7 +7,7 @@ const paths = [...new Set(execFileSync('git', [
 ], { encoding: 'utf8' }).split('\0').filter(Boolean))]
 const findings = []
 const report = (path, line, reason) => findings.push(`${path}${line ? `:${line}` : ''}: ${reason}`)
-const denied = /(?:^|\/)(?:node_modules|dist(?:-[^/]*)?|raw|staging|processed|runs|\.claude|\.codex|\.cursor|\.vscode|\.handoff-bridge)(?:\/|$)|(?:^|\/)\.env(?:\..*)?$|\.(?:pem|key|p12|pfx|har|log|zip|crx|tgz)$|(?:^|\/)curl\.txt$|(?:^|\/)[^/]*-chats-[^/]*\.json$/i
+const denied = /(?:^|\/)(?:node_modules|dist(?:-[^/]*)?|raw|staging|processed|runs|work|mockups|context|tinker-finetune|\.claude|\.codex|\.cursor|\.vscode|\.handoff-bridge)(?:\/|$)|(?:^|\/)\.env(?:\..*)?$|\.(?:pem|key|p12|pfx|har|log|zip|crx|tgz)$|(?:^|\/)curl\.txt$|(?:^|\/)[^/]*-chats-[^/]*\.json$/i
 const secrets = [
   /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g,
   /\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{20,}|xai-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|AIza[A-Za-z0-9_-]{30,})\b/g,
@@ -17,6 +17,7 @@ const email = /\b[A-Za-z0-9._%+-]{1,100}@([A-Za-z0-9.-]{1,100}\.[A-Za-z]{2,})\b/
 const hostPath = /(?:\/Users\/|\/home\/|[A-Z]:[\\/]+Users[\\/]+)([A-Za-z0-9_.-]+)/g
 const machineExtension = /chrome-extension:\/\/[a-p]{32}\b/g
 const oldBrand = /ai-extension|AI Extension|\bSam\b|\bsam[-_]|SAM_BRIDGE|AI_EXT_/g
+const privateNetwork = /\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b|\b[\w.-]+\.ts\.net\b/g
 
 for (const path of paths.sort()) {
   if (denied.test(path) && path !== '.env.example') report(path, 0, 'local/private/generated file is eligible for publication')
@@ -45,6 +46,9 @@ for (const path of paths.sort()) {
     if (!['me', 'nobody', 'user', 'example', '...'].includes(match[1])) report(path, lineAt(match.index), 'personal machine path')
   }
   for (const match of text.matchAll(machineExtension)) report(path, lineAt(match.index), 'hard-coded installation ID')
+  if (path !== 'scripts/audit-public.mjs') {
+    for (const match of text.matchAll(privateNetwork)) report(path, lineAt(match.index), 'private network endpoint')
+  }
   if (path !== 'scripts/audit-public.mjs') {
     for (const match of text.matchAll(oldBrand)) report(path, lineAt(match.index), 'legacy product branding')
   }

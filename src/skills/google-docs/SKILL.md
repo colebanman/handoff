@@ -2,7 +2,7 @@
 name: google-docs
 description: Write, format, and structure Google Docs reliably — enter text, change font/size/spacing, build MLA/APA papers, add page numbers and headers, and read the document back. Use whenever the task involves docs.google.com/document (writing an essay, formatting a paper, editing a doc).
 metadata:
-  version: "1"
+  version: "2"
   short-description: Reliable Google Docs authoring & formatting
 ---
 
@@ -29,7 +29,11 @@ Since you can't see the body, confirm your work by exporting the doc as plain te
 // docId = the /d/<ID> segment of the CURRENT tab url. IMPORTANT: a brand-new
 // doc's id CHANGES after the first edit/save, so always re-read it from the
 // live url, don't cache the one from docs.new.
-const url = (await api.tabs.list()).find(t => t.active)?.url || ''
+// Use the explicit tabId observed when opening/snapshotting this document.
+// Chrome's active tab can be an unrelated page while we work in the background.
+const tab = await api.tabs.get(tabId)
+const url = tab.url || ''
+if (!/^https:\/\/docs\.google\.com\/document\/d\//.test(url)) throw new Error('Target is no longer the expected Google Doc')
 const docId = url.match(/\/d\/([^/]+)/)?.[1]
 const r = await api.fetch(`https://docs.google.com/document/d/${docId}/export?format=txt&t=${Date.now()}`)
 return r.text.slice(0, 2000)   // the document's text content
@@ -49,8 +53,9 @@ The document accepts normal key events. For normal writing, use `browser_type` f
 **Bulk insertion:** use raw CDP `Input.insertText` via `sandbox_exec` — it drops the whole string in at the caret in one call (tens of ms), including punctuation, quotes, and unicode like em dashes:
 
 ```js
-const url = (await api.tabs.list()).find(t => t.active)?.url || ''
-const tabId = (await api.tabs.list()).find(t => t.active)?.id
+// tabId is the explicit observed document tab; persist that id in state if needed.
+const tab = await api.tabs.get(tabId)
+if (!/^https:\/\/docs\.google\.com\/document\/d\//.test(tab.url || '')) throw new Error('Target is no longer the expected Google Doc')
 await api.cdp(tabId, 'Input.insertText', { text: 'A whole paragraph inserted at once, with "quotes" and — dashes.' })
 ```
 
