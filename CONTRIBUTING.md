@@ -6,6 +6,7 @@ Before submitting a change, run:
 
 ```bash
 npm run typecheck
+npm run typecheck:ui
 npm test
 npm run test:chatgpt-auth
 npm run audit:public
@@ -15,6 +16,10 @@ npm run build
 Keep changes focused. Describe the user-visible behavior, relevant implementation decisions, and checks you ran. Update the documentation when behavior changes. Use synthetic examples and reserved example domains in tests and screenshots.
 
 ## Manual browser checks
+
+`npm run test:ui` runs production UI components with synthetic service boundaries in a disposable Chrome profile. [UI stress documentation](scripts/ui-stress/README.md) covers focused suites, view sizes, reduced motion, browser discovery, and a built-extension smoke test. These fixtures do not use a personal browser profile or call a model service.
+
+`node scripts/memory-e2e.mjs <temporary-build-directory>` checks real extension storage and cross-chat recall using a local fake provider. Build into a newly created temporary directory: the smoke runners tighten that disposable build's network policy. `node scripts/build-form-fill-test.mjs --combobox` bundles the production form driver and a development-only React Select fixture. Historical trace/replay scripts take an explicitly supplied export path; keep input data and reports outside the repository.
 
 Use a separate development installation and disposable local fixtures. The scripts under `scripts/` that use Playwriter are opt-in integration checks, not part of `npm test`; some make real model requests and change extension storage.
 

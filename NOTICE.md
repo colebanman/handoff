@@ -4,4 +4,6 @@ Handoff's project code is distributed under the MIT license in [LICENSE](LICENSE
 
 The browser-harness, Playwriter, and cursor-sdk projects informed the browser-control, persistent sandbox, and streaming UI architecture. They are not vendored in this source distribution. Historical reference checkouts and extracted design research are not included.
 
+The direct Claude OAuth and Messages interoperability code follows protocol details documented by Anthropic and the [MIT-licensed Pi project](https://github.com/earendil-works/pi/blob/main/LICENSE). Source comments link the relevant upstream implementations. KaTeX, the model SDKs, tokenization libraries, and other installed packages retain their own licenses; React Select is used only by development fixtures.
+
 OpenAI, Chrome, Claude, Cursor, and other provider or product names in the documentation identify integrations; Handoff is an independent project.
