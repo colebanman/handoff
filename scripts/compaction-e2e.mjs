@@ -2,7 +2,7 @@
 // playwriter -s <direct-session> --timeout 180000 -f scripts/compaction-e2e.mjs
 // Exercises the actual extension UI, worker, OAuth transport, and persisted history.
 const assert = require('assert').strict
-const extensionURL = state.handoffExtensionURL
+const extensionURL = state.compactionExtensionURL ?? state.handoffExtensionURL
 assert.match(extensionURL ?? '', /^chrome-extension:\/\/[a-p]{32}\/sidepanel\.html$/, 'Set state.handoffExtensionURL to the installed dev extension sidepanel URL first')
 state.dev ??= await context.newPage()
 if (state.dev.url() !== extensionURL) await state.dev.goto(extensionURL)

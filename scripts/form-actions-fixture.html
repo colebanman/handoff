@@ -1,0 +1,102 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Disposable form action backtest</title>
+<link rel="icon" href="data:,">
+<style>
+body { font: 16px system-ui; margin: 20px; }
+[role=group] { margin: 10px 0; height: 66px; }
+button { display: block; width: 260px; height: 36px; }
+[role=listbox] { position: fixed; left: 310px; top: 30px; background: white; border: 1px solid; width: 220px; z-index: 10; }
+[role=option] { padding: 12px; cursor: pointer; }
+</style>
+<main id="form"></main>
+<script>
+// This fixture models failure modes, not Workday's private implementation.
+window.configure = (config) => {
+  const form = document.getElementById('form');
+  form.replaceChildren();
+  document.querySelectorAll('[role=listbox]').forEach(el => el.remove());
+  const data = { values: Array(4).fill(null), writes: [], unintended: 0, boundaryExceeded: 0, dependency: false };
+  let pending = 0, serial = 0;
+  const later = (ms, fn) => {
+    if (!ms) { fn(); return; }
+    pending++;
+    setTimeout(() => { try { fn(); } finally { pending--; } }, ms);
+  };
+  const fields = [];
+  const makeButton = (index, group) => {
+    const button = document.createElement('button');
+    button.textContent = data.values[index] ? `${data.values[index]} Required` : 'Select One Required';
+    button.setAttribute('aria-haspopup', 'listbox');
+    button.setAttribute('aria-expanded', 'false');
+    if (config.disabled && index === 0) button.disabled = true;
+    button.onclick = () => {
+      if (button.getAttribute('aria-expanded') === 'true') return;
+      if (data.dependency && index > 0) data.boundaryExceeded++;
+      const id = `popup-${++serial}`;
+      button.setAttribute('aria-controls', id);
+      button.setAttribute('aria-expanded', 'true');
+      later(config.openDelay || 0, () => {
+        const popup = document.createElement('div');
+        popup.id = id;
+        popup.setAttribute('role', 'listbox');
+        popup.setAttribute('aria-label', `Choices for Question ${index + 1}`);
+        // Old portals can remain mounted and accessible during an exit animation.
+        popup.style.top = `${30 + index * 110}px`;
+        let options = config.reordered && index % 2 ? ['No', 'Yes'] : ['Yes', 'No'];
+        if (config.missing && index === 0) options = ['Yes'];
+        if (config.duplicate && index === 0) options = ['Yes', 'No', 'No'];
+        for (const value of options) {
+          const option = document.createElement('div');
+          option.setAttribute('role', 'option'); option.textContent = value;
+          option.onclick = () => {
+            button.setAttribute('aria-busy', 'true');
+            later(config.commitDelay || 0, () => {
+              if (!config.reject) {
+                data.values[index] = value; data.writes.push({ index, value });
+                button.textContent = `${value} Required`;
+              }
+              button.setAttribute('aria-expanded', 'false');
+              button.removeAttribute('aria-busy');
+              later(config.exitDelay || 0, () => popup.remove());
+              if (config.rerender && index === 0) {
+                fields.forEach((f, i) => { f.button.remove(); f.button = makeButton(i, f.group); });
+              }
+              if (config.dependent && index === 0 && !data.dependency) {
+                data.dependency = true;
+                const extra = document.createElement('div');
+                extra.setAttribute('role', 'group'); extra.setAttribute('aria-label', 'Explain your answer');
+                extra.innerHTML = '<label>Details <input aria-label="Details" required></label>';
+                form.append(extra);
+              }
+            });
+          };
+          popup.append(option);
+        }
+        document.body.append(popup);
+      });
+    };
+    group.append(button); return button;
+  };
+  if (config.decoy) {
+    const decoy = document.createElement('div');
+    decoy.setAttribute('role', 'listbox'); decoy.setAttribute('aria-label', 'Unrelated choices');
+    decoy.style.left = '620px';
+    const option = document.createElement('div'); option.setAttribute('role', 'option'); option.textContent = 'No';
+    option.onclick = () => { data.unintended++; };
+    decoy.append(option); document.body.append(decoy);
+  }
+  for (let i = 0; i < 4; i++) {
+    const group = document.createElement('div'); group.setAttribute('role', 'group');
+    group.setAttribute('aria-label', `Question ${i + 1}`); group.append(`Question ${i + 1}`); form.append(group);
+    fields.push({ group, button: makeButton(i, group) });
+  }
+  window.fixture = {
+    read: () => structuredClone(data),
+    // Ground truth waits are available to the test oracle, never to the drivers.
+    idle: () => new Promise(resolve => {
+      const poll = () => pending ? setTimeout(poll, 10) : resolve(); poll();
+    }),
+  };
+};
+</script>

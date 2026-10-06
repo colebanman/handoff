@@ -12,7 +12,9 @@
     "bridge": "node bridge/handoff-bridge.mjs start",
     "test:chatgpt-auth": "node scripts/verify-chatgpt-auth.mjs",
     "typecheck": "tsc --noEmit",
-    "audit:public": "node scripts/audit-public.mjs"
+    "audit:public": "node scripts/audit-public.mjs",
+    "test:ui": "node scripts/ui-stress/run.mjs",
+    "typecheck:ui": "tsc --noEmit -p scripts/ui-stress/tsconfig.json"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.127",
@@ -51,6 +53,7 @@
     "fake-indexeddb": "^6.2.5",
     "micromark-extension-math": "^3.1.0",
     "micromark-util-types": "^2.0.3",
+    "react-select": "^5.10.2",
     "remark-parse": "^11.0.0",
     "typescript": "^5.9.0",
     "vite": "^7.1.0",

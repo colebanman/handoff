@@ -21,6 +21,7 @@ curl.txt
 
 # Personal exports, datasets, archives, and editor/agent state
 *-chats-*.json
+*-memories-*.json
 raw/
 staging/
 processed/
