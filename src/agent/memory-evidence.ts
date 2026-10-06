@@ -51,9 +51,12 @@ export function memoryParent(chatId: string, item: TranscriptItem): string {
 
 function* transcriptUnits(items: TranscriptItem[], chat: ChatRecord, delegated = false, initialAt = chat.createdAt): Generator<EvidenceUnit> {
   let latestAt = initialAt
+  const zones = turnZones(chat)
+  let timeZone: string | undefined
   for (const item of items) {
+    if (item.kind === 'user') timeZone = zones.get(item.id)
     const exact = 'at' in item && typeof item.at === 'number' && Number.isFinite(item.at) ? item.at : undefined
-    const common = { chatId: chat.id, itemId: item.id, at: exact ?? latestAt, timeBasis: exact !== undefined ? 'event' as const : latestAt === chat.createdAt ? 'chat' as const : 'turn' as const }
+    const common = { chatId: chat.id, itemId: item.id, at: exact ?? latestAt, timeZone, timeBasis: exact !== undefined ? 'event' as const : latestAt === chat.createdAt ? 'chat' as const : 'turn' as const }
     const parentId = memoryParent(chat.id, item)
     if (exact !== undefined) latestAt = exact
     if (item.kind === 'user' && !item.pending && item.text.trim() && !isRuntimeContextText(item.text)) {
@@ -75,6 +78,19 @@ function* transcriptUnits(items: TranscriptItem[], chat: ChatRecord, delegated =
       for (const agent of item.workflow?.agents ?? []) if (agent.items) yield* transcriptUnits(agent.items, chat, true, common.at)
     }
   }
+}
+
+function turnZones(chat: ChatRecord): Map<string, string> {
+  const zones = new Map<string, string>()
+  for (const checkpoint of chat.checkpoints ?? []) {
+    const message = chat.messages[checkpoint.messageCountBefore] as { role?: string; content?: unknown } | undefined
+    if (message?.role !== 'user') continue
+    const text = typeof message.content === 'string' ? message.content : Array.isArray(message.content) ? message.content.flatMap((p) => typeof p?.text === 'string' ? [p.text] : []).join('\n') : ''
+    const zone = [...text.matchAll(/<context>\s*Local time:[^\r\n]*\(([^()]+)\)/g)].at(-1)?.[1]
+    if (!zone) continue
+    try { new Intl.DateTimeFormat('en', { timeZone: zone }); zones.set(checkpoint.userItemId, zone) } catch { /* Unknown historical zone stays unknown. */ }
+  }
+  return zones
 }
 
 /** Older harnesses may lack UI items. Model roles alone never establish human authorship. */

@@ -4,6 +4,25 @@ import type { ChatRecord, TranscriptItem } from '../shared/types'
 
 const chat = (transcript: TranscriptItem[]): ChatRecord => ({ id: 'chat', title: 'Project discussion', createdAt: 10, updatedAt: 20, modelId: 'old-harness', transcript, messages: [] })
 describe('experience normalization', () => {
+  it('uses each recorded turn zone and does not carry it into a turn with unknown context', async () => {
+    const record = chat([
+      { kind: 'user', id: 'paris', text: 'The project ends tomorrow.', at: 10 },
+      { kind: 'text', id: 'reply', agentId: 'main', text: 'Noted the project date.', streaming: false, at: 11 },
+      { kind: 'user', id: 'tokyo', text: 'The event starts tomorrow.', at: 12 },
+      { kind: 'user', id: 'unknown', text: 'An older message with no recorded zone.', at: 13 },
+    ])
+    record.messages = [
+      { role: 'user', content: 'The project ends tomorrow.\n<context>\nLocal time: example (Europe/Paris)\n</context>' },
+      { role: 'user', content: [{ type: 'text', text: '<context>\nLocal time: example (Asia/Tokyo)\n</context>' }] },
+      { role: 'user', content: '<context>\nLocal time: example (Not/AZone)\n</context>' },
+    ]
+    record.checkpoints = ['paris', 'tokyo', 'unknown'].map((id, index) => ({
+      id: `checkpoint-${index}`, userItemId: id, userText: id, at: 10 + index,
+      transcriptIndexBefore: index, messageCountBefore: index,
+    }))
+    const events = await extractMemoryEvents(record)
+    expect(events.map(event => event.timeZone)).toEqual(['Europe/Paris', 'Europe/Paris', 'Asia/Tokyo', undefined])
+  })
   it('preserves actual source roles and excludes reasoning and running output', async () => {
     const events = await extractMemoryEvents(chat([
       { kind: 'user', id: 'u', text: 'The project is finished.', at: 10 },
