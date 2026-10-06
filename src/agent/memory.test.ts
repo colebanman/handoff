@@ -197,15 +197,14 @@ describe('memory prompt snapshot', () => {
 
   it('represents no memories as an empty array and redacts accidental secrets', () => {
     expect(serializeMemoryForPrompt([])).toBe('[]')
-    const fakeKey = `sk-proj-${'x'.repeat(36)}`
     const json = serializeMemoryForPrompt([
       {
         title: '[Stable] Developer account — preferred API provider',
-        body: `Uses key ${fakeKey} for testing.`,
+        body: `Uses key ${'sk-proj-' + 'abcdefghijklmnopqrstuvwxyz1234567890'} for testing.`,
         date: '2026-08-06',
       },
     ])
-    expect(json).not.toContain(fakeKey)
+    expect(json).not.toContain('sk-proj-' + 'abcdefghijklmnopqrstuvwxyz1234567890')
     expect(json).toContain('[redacted:openai-key')
   })
 

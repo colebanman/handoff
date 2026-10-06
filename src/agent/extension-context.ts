@@ -52,7 +52,7 @@ export async function observeExtensionContext(entries: ExtensionSummary[], tabs:
 }
 
 export function extensionContext(entries: ExtensionSummary[], task: string, tabs: ContextTab[], options: RuntimeContextOptions,
-  sensed = new Map<number, Record<string, Match>>(), learningEnabled = true, semantic?: Map<string, number>): { block: string; revisions: Record<string, number> } {
+  sensed = new Map<number, Record<string, Match>>(), learningEnabled = true): { block: string; revisions: Record<string, number> } {
   const available = options.offlineOnly ? [] : tabs.filter((t) => t.id !== undefined && (!options.isSubagent || options.allowedTabIds?.includes(t.id)))
   const scored = entries.filter((e) => e.enabled).flatMap((entry) => {
     const { manifest } = entry
@@ -65,11 +65,10 @@ export function extensionContext(entries: ExtensionSummary[], task: string, tabs
     })
     const conditional = manifest.when ? available.some((tab) => evaluateRule(manifest.when!, { url: tab.url, task, observations: sensed.get(tab.id!) }) === true)
       || evaluateRule(manifest.when, { task }) === true : false
-    const relevance = Math.max(0, ...Object.keys(manifest.actions).map((path) => semantic?.get(`${entry.id}.${path}@${entry.revision}`) ?? 0))
-    if (!explicit && !targets.length && !conditional && !(local && relevance >= 0.65)) return []
+    if (!explicit && !targets.length && !conditional) return []
     if (options.isSubagent && !local && !targets.length) return []
     const focused = targets.some((t) => t.id === options.currentTabId || task.includes(`@tab(${t.id}`))
-    return [{ entry, targets, score: explicit ? 100 : semantic ? relevance * 70 + (focused ? 10 : 0) : focused ? 60 : conditional ? 30 : 20 }]
+    return [{ entry, targets, score: explicit ? 100 : focused ? 60 : conditional ? 30 : 20 }]
   }).sort((a, b) => b.score - a.score || a.entry.id.localeCompare(b.entry.id))
   const lines: string[] = [], revisions: Record<string, number> = Object.create(null)
   const index = contextText(scored.slice(0, 12).map(({entry}) => `${entry.id}@${entry.revision}`).join(', '))
@@ -80,7 +79,7 @@ export function extensionContext(entries: ExtensionSummary[], task: string, tabs
     const header = contextText(`${entry.id}@${entry.revision}: ${entry.description} (${targets.length ? `tabs ${targets.slice(0, 8).map((t) => t.id).join(',')}${targets.length > 8 ? ',…' : ''}` : 'no bound tab; inspect setup'})`)
     const actions = Object.entries(entry.manifest.actions).sort(([a], [b]) => {
       const score = (v: string) => v.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase().split(/\W/).filter((w) => w.length > 3 && task.toLowerCase().includes(w)).length
-      return (semantic ? (semantic.get(`${entry.id}.${b}@${entry.revision}`) ?? 0) - (semantic.get(`${entry.id}.${a}@${entry.revision}`) ?? 0) : 0) || score(b) - score(a) || a.localeCompare(b)
+      return score(b) - score(a) || a.localeCompare(b)
     }).map(([path, spec]) => {
       const signature = schemaSignature(spec.input)
       return contextText(`apps.${entry.id}.${path}(${signature.length <= 300 ? signature : 'input'}) — ${spec.description} [${spec.effects}; ${entry.results.some((r) => r.action === path && r.mode === 'live' && r.ok) ? 'live-tested' : 'fixture-tested'}]`)

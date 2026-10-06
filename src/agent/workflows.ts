@@ -1,5 +1,5 @@
 /**
- * Dynamic workflow coordinator.
+ * Dynamic workflow coordinator ("Ultracode").
  *
  * A workflow is model-authored JavaScript evaluated in the existing manifest
  * sandbox with a workflow-only RPC dispatcher. The script may fan out and
@@ -21,6 +21,7 @@ import { WORKFLOW_MAX_WALL_TIMEOUT_MS } from '../shared/rpc'
 import { uid } from '../shared/ids'
 import { debugLog } from '../shared/debug-log'
 import { formatError } from '../shared/errors'
+import { toolResultError } from '../shared/tool-results'
 import type { RunWorkflowFn, SpawnSubagentFn, WorkflowRunInput } from './tools'
 import type { TaskRegistry } from './tasks'
 
@@ -321,7 +322,7 @@ export function makeRunWorkflow(deps: WorkflowDeps): RunWorkflowFn {
             onEvent,
             signal,
           })
-          if (result.startsWith('Error: subagent failed')) {
+          if (toolResultError(result)) {
             agent.status = signal.aborted ? 'cancelled' : 'error'
             agent.error = result
             agent.endedAt = Date.now()

@@ -122,6 +122,8 @@ describe('CdpServiceImpl pointer arrival', () => {
     stubGeometry(service)
     vi.spyOn(service, 'send').mockImplementation(async (_tabId: number, method: string) => {
       order.push(method)
+      if (method === 'DOM.resolveNode') return { object: { objectId: 'target' } } as never
+      if (method === 'Runtime.callFunctionOn') return { result: { value: true } } as never
       return undefined as never
     })
 
@@ -130,7 +132,8 @@ describe('CdpServiceImpl pointer arrival', () => {
 
     expect(showAndWait).toHaveBeenCalledWith(7, { kind: 'move', x: 10, y: 20 }, signal)
     expect(order).toEqual([
-      'cursor', 'Input.dispatchMouseEvent', 'Input.dispatchMouseEvent', 'Input.dispatchMouseEvent',
+      'cursor', 'Input.dispatchMouseEvent', 'DOM.resolveNode', 'Runtime.callFunctionOn',
+      'Input.dispatchMouseEvent', 'Input.dispatchMouseEvent', 'Runtime.releaseObject',
     ])
   })
 
@@ -233,5 +236,104 @@ describe('CdpServiceImpl.switchTabs', () => {
 
     expect(activate).toHaveBeenCalledOnce()
     expect(switchTabs).not.toHaveBeenCalled()
+  })
+})
+
+describe('form writes are not retried after a debugger detach', () => {
+  afterEach(() => vi.unstubAllGlobals())
+  it.each(['Input.dispatchMouseEvent', 'Input.insertText', 'Runtime.evaluate', 'Page.navigate'])('never replays %s after an uncertain detach', async (method) => {
+    const runtime: { lastError?: { message: string } } = {}
+    const sendCommand = vi.fn((_target, _method, _params, callback) => {
+      runtime.lastError = { message: 'Detached while handling command' }
+      callback(undefined)
+      delete runtime.lastError
+    })
+    vi.stubGlobal('chrome', { runtime, debugger: { sendCommand } })
+    const service = makeService({ show: vi.fn(), hideOnNavigate: vi.fn() })
+    await expect(service.send(7, method, { type: 'mousePressed' })).rejects.toThrow('not replayed')
+    expect(sendCommand).toHaveBeenCalledTimes(1)
+    expect(service.attach).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('ordinary ref actions verify their targets', () => {
+  it('does not press on an overlay that covers the intended target', async () => {
+    const service = makeService({ show: vi.fn(), showAndWait: vi.fn() })
+    const internal = service as any
+    internal.resolveRef = () => 5
+    internal.centerOf = async () => ({ x: 10, y: 20 })
+    const send = vi.spyOn(service, 'send').mockImplementation(async (_tab, method) => {
+      if (method === 'DOM.resolveNode') return { object: { objectId: 'target' } } as never
+      return { result: { value: false } } as never
+    })
+    await expect(service.click(7, 'e1')).rejects.toThrow('no click was dispatched')
+    expect(send.mock.calls.filter(c => c[1] === 'Input.dispatchMouseEvent').map(c => (c[2] as any).type)).toEqual(['mouseMoved'])
+  })
+
+  it('does not clear, type or submit when focus stays on another field', async () => {
+    const service = makeService({ show: vi.fn(), showAndWait: vi.fn() })
+    const internal = service as any
+    internal.resolveRef = () => 5
+    internal.centerOf = async () => ({ x: 10, y: 20 })
+    internal.focusNode = async () => 'target'
+    const send = vi.spyOn(service, 'send').mockResolvedValue({ result: { value: false } })
+    await expect(service.type(7, 'e1', 'new value', { clear: true, submit: true })).rejects.toThrow('no text was dispatched')
+    expect(send.mock.calls.some(c => c[1].startsWith('Input.'))).toBe(false)
+  })
+})
+
+describe('evaluation compiles before executing once', () => {
+  it.each([false, true])('does not replay a runtime SyntaxError (frame=%s)', async (frame) => {
+    const service = makeService({})
+    Object.defineProperty(service, 'tabState', { value: new Map([[7, { frameSessions: new Map() }]]) })
+    let writes = 0
+    const send = vi.spyOn(service, 'send').mockImplementation(async (_tab, method, params: any) => {
+      if (method === 'Page.createIsolatedWorld') return { executionContextId: 9 } as never
+      if (method === 'Runtime.compileScript') { new Function(params.expression); return {} as never }
+      if (method === 'Runtime.evaluate') {
+        writes++
+        return { exceptionDetails: { exception: { className: 'SyntaxError', description: 'SyntaxError: invalid JSON' } } } as never
+      }
+      return {} as never
+    })
+    const expression = '(window.count++, JSON.parse("invalid-json"))'
+    await expect(frame ? service.evalInFrame(7, 'frame', expression) : service.evalInPage(7, expression)).rejects.toThrow('invalid JSON')
+    expect(writes).toBe(1)
+    expect(send.mock.calls.filter(c => c[1] === 'Runtime.compileScript')).toHaveLength(1)
+  })
+
+  it.each(['1 + 2', 'const n = 1; return n + 2'])('returns %s without executing a failed parse attempt', async expression => {
+    const service = makeService({})
+    let executions = 0
+    vi.spyOn(service, 'send').mockImplementation(async (_tab, method, params: any) => {
+      if (method === 'Runtime.compileScript') {
+        try { new Function(params.expression); return {} as never }
+        catch { return { exceptionDetails: { exception: { className: 'SyntaxError' } } } as never }
+      }
+      executions++
+      return { result: { value: await new Function(`return ${params.expression}`)() } } as never
+    })
+    await expect(service.evalInPage(7, expression)).resolves.toBe(3)
+    expect(executions).toBe(1)
+  })
+})
+
+describe('literal text entry', () => {
+  it.each(['&', '%', ';', '+', '\n', '\t', '•', 'é', '你', '🧪'])('inserts %j without emitting navigation/submit key codes', async ch => {
+    const service = makeService({ show: vi.fn() })
+    const send = vi.spyOn(service, 'send').mockResolvedValue({})
+    const internals = service as unknown as { typeChar: (tab: number, ch: string, signal?: AbortSignal) => Promise<void> }
+    const signal = new AbortController().signal
+    await internals.typeChar(7, ch, signal)
+    expect(send.mock.calls).toEqual([[7, 'Input.insertText', { text: ch }, signal]])
+  })
+  it('keeps physical key events for ordinary letters', async () => {
+    const service = makeService({ show: vi.fn() })
+    const send = vi.spyOn(service, 'send').mockResolvedValue({})
+    const internals = service as unknown as { typeChar: (tab: number, ch: string) => Promise<void> }
+    await internals.typeChar(7, 'a')
+    expect(send.mock.calls.map(c => [c[1], (c[2] as { type: string }).type])).toEqual([
+      ['Input.dispatchKeyEvent', 'keyDown'], ['Input.dispatchKeyEvent', 'char'], ['Input.dispatchKeyEvent', 'keyUp'],
+    ])
   })
 })

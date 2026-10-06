@@ -1,10 +1,10 @@
 /**
- * First-run onboarding: ChatGPT sign-in FIRST, then the walkthrough, then the
+ * First-run onboarding: subscription sign-in FIRST, then the walkthrough, then the
  * optional Grok key, then done.
  *
  * The order is dictated by timing, not by narrative. The Luna pass (one
  * background model call that seeds MEMORY.md and the starter prompts from the
- * user's own Chrome data) cannot start until an OpenAI credential exists, and
+ * user's own Chrome data) cannot start until a model credential exists, and
  * every screen after that point is latency we get for free — so sign-in happens
  * on the welcome screen and `markConnected` fires the pass the instant it lands.
  * The four walkthrough screens are the cover, and there is deliberately no
@@ -19,6 +19,7 @@
 import { useEffect, useState } from 'react'
 import {
   connectChatGPTAccount,
+  connectClaudeAccount,
   connectProviderKey,
   completeOnboarding,
   saveUserName,
@@ -36,6 +37,7 @@ import {
 import { formatError } from '../../shared/errors'
 import { debugLog } from '../../shared/debug-log'
 import { ChatGPTAccount } from './ChatGPTAccount'
+import { ClaudeAccount } from './ClaudeAccount'
 
 /** Providers with a dedicated connect screen after the walkthrough (OpenAI is on welcome). */
 const CONNECT_PROVIDERS: ProvisionProvider[] = ['xai']
@@ -145,15 +147,15 @@ export function Onboarding(): React.ReactElement {
     next()
   }
   /**
-   * Single place the Luna pass is triggered. Any OpenAI credential will do — the
-   * pass is a GPT prompt, not a subscription feature — and hanging it off
+   * Single place the personalization pass is triggered. Claude and OpenAI
+   * credentials both work; hanging it off
    * "connected" rather than off one specific button means the key and paste paths
-   * get it too. Idempotent, so the ChatGPT card firing `onConnected` again from
+   * get it too. Idempotent, so an account card firing `onConnected` again from
    * its mount effect is harmless.
    */
-  const markConnected = (provider: ProvisionProvider): void => {
+  const markConnected = (provider: ProvisionProvider | 'anthropic'): void => {
     setConnected((prev) => new Set(prev).add(provider))
-    if (provider === 'openai') startOnboardingSetup()
+    if (provider === 'openai' || provider === 'anthropic') startOnboardingSetup()
   }
 
   const progress = (
@@ -240,19 +242,17 @@ export function Onboarding(): React.ReactElement {
 /* ---- intro screens ------------------------------------------------------- */
 
 /**
- * Welcome + sign-in on one screen. ChatGPT is the primary path (it is what makes
- * the Luna pass — and therefore the seeded memory and starter prompts — possible);
- * the API-key path is a quiet link into the same ConnectProvider machinery the
- * other providers use, with its ChatGPT card suppressed since it lives above.
+ * Welcome + a choice of subscription sign-in on one screen. The API-key path
+ * uses the same ConnectProvider machinery as the optional provider screen.
  */
 function ScreenWelcome({
   onDone,
   onConnected,
 }: {
   onDone: () => void
-  onConnected: (provider: ProvisionProvider) => void
+  onConnected: (provider: ProvisionProvider | 'anthropic') => void
 }): React.ReactElement {
-  const [mode, setMode] = useState<'chatgpt' | 'key'>('chatgpt')
+  const [mode, setMode] = useState<'chatgpt' | 'claude' | 'key'>('chatgpt')
 
   if (mode === 'key') {
     return (
@@ -275,7 +275,15 @@ function ScreenWelcome({
         set it up around how you already browse.
       </p>
       <div className="onb__auth">
-        <ChatGPTAccount
+        {mode === 'claude' ? (
+          <ClaudeAccount
+            variant="onboarding"
+            onConnected={async () => {
+              await connectClaudeAccount()
+              onConnected('anthropic')
+            }}
+          />
+        ) : <ChatGPTAccount
           variant="onboarding"
           onConnected={async () => {
             await connectChatGPTAccount()
@@ -283,7 +291,10 @@ function ScreenWelcome({
             // credential path at once; don't add a second trigger here.
             onConnected('openai')
           }}
-        />
+        />}
+        <button className="onb__link" onClick={() => setMode(mode === 'claude' ? 'chatgpt' : 'claude')}>
+          {mode === 'claude' ? 'Use a ChatGPT subscription' : 'Use a Claude subscription'}
+        </button>
         <button className="onb__link" onClick={() => setMode('key')}>
           Use an API key instead
         </button>
@@ -360,7 +371,7 @@ function ScreenDone({ hasKey }: { hasKey: boolean }): React.ReactElement {
         <div className="onb__mark onb__mark--warn">!</div>
         <h1 className="onb__title">No provider connected yet</h1>
         <p className="onb__lead">
-          You’ll need a ChatGPT account or provider API key to chat. You can connect one any time from
+          You’ll need a Claude or ChatGPT subscription, or a provider API key, to chat. You can connect one any time from
           Settings, or go Back to set one up now.
         </p>
       </div>

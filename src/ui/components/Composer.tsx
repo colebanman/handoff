@@ -194,6 +194,7 @@ export const Composer = memo(function Composer({
   modelId,
   provider,
   openaiAuthMode,
+  anthropicAuthMode,
   modelProviders,
   attachments,
   browserContexts,
@@ -231,6 +232,7 @@ export const Composer = memo(function Composer({
   modelId: string
   provider: ProviderKind
   openaiAuthMode?: 'api-key' | 'chatgpt'
+  anthropicAuthMode?: 'claude' | 'api-key'
   /** Picker groups with live credentials (store.availableModelProviders). */
   modelProviders: CuratedModelProvider[]
   attachments: PendingAttachment[]
@@ -571,13 +573,17 @@ export const Composer = memo(function Composer({
                 className={`attachment-chip${att.kind === 'appshot' ? ' attachment-chip--appshot' : ''}`}
                 title={att.kind === 'appshot' ? `${att.title || 'TabShot'}\n${att.url ?? ''}` : att.name}
               >
-                <img className="attachment-chip__thumb" src={att.previewUrl} alt="" />
+                {att.kind === 'file' ? (
+                  <span className="attachment-chip__file-icon" aria-hidden="true">📄</span>
+                ) : (
+                  <img className="attachment-chip__thumb" src={att.previewUrl} alt="" />
+                )}
                 <span className="attachment-chip__text">
                   <span className="attachment-chip__label">
                     {att.kind === 'appshot' ? att.title || 'TabShot' : att.name}
                   </span>
                   <span className="attachment-chip__detail">
-                    {att.kind === 'appshot' ? compactUrl(att.url) || 'Active tab capture' : 'Image'}
+                    {att.kind === 'appshot' ? compactUrl(att.url) || 'Active tab capture' : att.kind === 'file' ? 'File' : 'Image'}
                   </span>
                 </span>
                 <button
@@ -633,7 +639,9 @@ export const Composer = memo(function Composer({
                 ? (disabledReason ??
                   (provider === 'openai' && openaiAuthMode === 'chatgpt'
                     ? 'Sign in with ChatGPT in Settings to start…'
-                    : 'Set your API key in Settings to start…'))
+                    : provider === 'anthropic' && (anthropicAuthMode ?? 'claude') === 'claude'
+                      ? 'Sign in with Claude in Settings to start…'
+                      : 'Set your API key in Settings to start…'))
                 : suggestion
                   ? ''
                   : 'Message the agent…'

@@ -30,6 +30,8 @@ import { SessionModelSwitch, type ModelSwitchScope, type SessionModelOverride } 
 import type { AgentContext, TaskAccess } from './tools'
 import type { ArtifactHostService } from '../shared/artifacts'
 import { createAgentTabGroups } from './tab-groups'
+import { uid } from '../shared/ids'
+import { latestContextTabId } from '../shared/browser-context'
 
 export type { ModelSwitchScope, SessionModelOverride } from './model-switch'
 
@@ -106,9 +108,11 @@ export function createAgentRuntime(deps: AgentDeps): AgentRuntime {
     }
 
     const agentId = 'main'
-    const currentTabId = await getActiveTabId()
+    const capturedTabId = latestContextTabId(opts.messages)
+    const currentTabId = capturedTabId === undefined ? await getActiveTabId() : capturedTabId ?? 0
     const ctx: AgentContext = {
       agentId,
+      surfaceOwnerId: `main:${opts.chatId}:${uid('owner')}`,
       currentTabId,
       // undefined => unrestricted main agent
       allowedTabIds: undefined,
@@ -119,6 +123,7 @@ export function createAgentRuntime(deps: AgentDeps): AgentRuntime {
 
     const subagents = makeSpawnSubagent({
       parentAgentId: agentId,
+      parentSurfaceOwnerId: ctx.surfaceOwnerId,
       chatId: opts.chatId,
       parentAllowedTabIds: undefined,
       getParentCurrentTabId: () => ctx.currentTabId,
@@ -151,37 +156,41 @@ export function createAgentRuntime(deps: AgentDeps): AgentRuntime {
       currentTabId,
     })
 
-    const result = await runLoop({
-      ctx,
-      chatId: opts.chatId,
-      settings: opts.settings,
-      modelId: opts.settings.modelId,
-      messages: opts.messages as ModelMessage[],
-      steering: opts.steering,
-      signal: opts.signal,
-      emit,
-      deps,
-      spawnSubagent: subagents.spawn,
-      messageSubagent: subagents.message,
-      runWorkflow,
-      tasks: taskAccess,
-      sandboxSessionId,
-      tabGroups,
-      isSubagent: false,
-      priority,
-      onStepLimit: opts.onStepLimit,
-      onStepMessages: opts.onStepMessages,
-      askUser: opts.askUser,
-      getModelOverride,
-    })
+    try {
+      const result = await runLoop({
+        ctx,
+        chatId: opts.chatId,
+        settings: opts.settings,
+        modelId: opts.settings.modelId,
+        messages: opts.messages as ModelMessage[],
+        steering: opts.steering,
+        signal: opts.signal,
+        emit,
+        deps,
+        spawnSubagent: subagents.spawn,
+        messageSubagent: subagents.message,
+        runWorkflow,
+        tasks: taskAccess,
+        sandboxSessionId,
+        tabGroups,
+        isSubagent: false,
+        priority,
+        onStepLimit: opts.onStepLimit,
+        onStepMessages: opts.onStepMessages,
+        askUser: opts.askUser,
+        getModelOverride,
+      })
 
-    return {
-      responseMessages: result.responseMessages,
-      text: result.text,
-      usage: result.usage,
-      finishReason: result.finishReason,
-      steps: result.stepCount,
-      errorText: result.errorText,
+      return {
+        responseMessages: result.responseMessages,
+        text: result.text,
+        usage: result.usage,
+        finishReason: result.finishReason,
+        steps: result.stepCount,
+        errorText: result.errorText,
+      }
+    } finally {
+      tabAssignments.releaseAll(ctx.surfaceOwnerId!)
     }
   }
 

@@ -590,12 +590,14 @@ class IndexedDbVirtualFileSystem implements VirtualFileSystemService {
 
   async search(
     query: string,
-    opts?: { root?: VfsRoot; maxResults?: number },
+    opts?: { root?: VfsRoot; prefix?: string; maxResults?: number },
   ): Promise<Array<{ path: string; lines: VfsLineResult['lines'] }>> {
     const needle = query.trim().toLowerCase()
     if (!needle) return []
     const maxResults = Math.max(1, opts?.maxResults ?? 20)
-    const files = (await this.allFiles()).filter((entry) => !opts?.root || entry.root === opts.root)
+    const prefix = opts?.prefix?.replace(/\/$/, '')
+    const files = (await this.allFiles()).filter((entry) => (!opts?.root || entry.root === opts.root) &&
+      (!prefix || entry.path === prefix || entry.path.startsWith(`${prefix}/`)))
     const out: Array<{ path: string; lines: string[] }> = []
     for (const file of files) {
       if (out.length >= maxResults) break

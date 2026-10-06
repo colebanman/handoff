@@ -5,57 +5,23 @@
  * header button.
  */
 import { useState, useRef, useEffect, memo } from 'react'
-import type { ProviderKind, Settings, Usage } from '../../shared/types'
+import type { Settings } from '../../shared/types'
 import type { ChatMeta } from '../../storage/chats'
 import type { ChatOrigin } from '../../shared/bridge-protocol'
 import { downloadChatExport } from '../../storage/export'
 import { debugLog } from '../../shared/debug-log'
 import type { OffscreenRuntimeMessage } from '../../shared/execution-protocol'
-import { openAIContextWindow } from '../../shared/model-context'
-import { listChatGPTModels } from '../../agent/openai-chatgpt-oauth'
+import { contextModelKey, defaultContextWindow, type ContextModel, type ContextWindow } from '../../shared/model-context'
+import { contextInputTokens, contextUsageMatches, contextMeterTitle, formatContextTokens, type ContextUsageInfo } from '../../shared/context-usage'
+import { resolveContextWindow } from '../../agent/model-context'
 import { SettingsIcon } from './SettingsIcon'
+import { ExpandView } from './ExpandView'
 
 const TAU = Math.PI * 2
 
-const FALLBACK_CONTEXT_WINDOWS: Record<string, number> = {
-  'openai/gpt-6-astra': 1_050_000,
-  'gpt-6-astra': 1_050_000,
-  'openai/gpt-5.6-sol': 1_050_000,
-  'gpt-5.6-sol': 1_050_000,
-  'openai/gpt-5.6-terra': 1_050_000,
-  'gpt-5.6-terra': 1_050_000,
-  'openai/gpt-5.6-luna': 1_050_000,
-  'gpt-5.6-luna': 1_050_000,
-  'google/gemini-3-pro': 1_000_000,
-  'openai/gpt-5': 400_000,
-  'openai/gpt-5-mini': 400_000,
-  'openai/gpt-5-nano': 400_000,
-  'gpt-5': 400_000,
-  'gpt-5-mini': 400_000,
-  'gpt-5-nano': 400_000,
-  'xai/grok-4.6': 500_000,
-  'grok-4.6': 500_000,
-  'grok-4.6-fast': 500_000,
-  'xai/grok-4.6-fast': 500_000,
-}
-
-function tokenCount(usage?: Usage): number | undefined {
-  if (!usage) return undefined
-  if (typeof usage.totalTokens === 'number') return usage.totalTokens
-  const total = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0)
-  return total > 0 ? total : undefined
-}
-
-function compactTokens(value: number | undefined): string {
-  if (typeof value !== 'number') return '—'
-  return new Intl.NumberFormat(undefined, {
-    notation: 'compact',
-    maximumFractionDigits: value < 10_000 ? 1 : 0,
-  }).format(value)
-}
-
-function formatChatTimestamp(value: number): string {
+export function formatChatTimestamp(value: number): string {
   const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return 'Unknown date'
   const now = new Date()
   const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
   const startValue = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime()
@@ -65,95 +31,56 @@ function formatChatTimestamp(value: number): string {
   return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).format(date)
 }
 
-function fullChatTimestamp(value: number): string {
+export function fullChatTimestamp(value: number): string {
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return 'Unknown date'
   return new Intl.DateTimeFormat(undefined, {
     year: 'numeric',
     month: 'short',
     day: 'numeric',
     hour: 'numeric',
     minute: '2-digit',
-  }).format(new Date(value))
+  }).format(date)
 }
 
-function gatewayLookupId(modelId: string, provider: ProviderKind): string | undefined {
-  const trimmed = modelId.trim()
-  if (!trimmed) return undefined
-  if (trimmed.includes('/')) return trimmed
-  if (provider === 'openai') return `openai/${trimmed}`
-  if (provider === 'xai') return `xai/${trimmed}`
-  return undefined
-}
-
-async function fetchGatewayContextWindow(modelId: string, signal: AbortSignal): Promise<number | undefined> {
-  const [creator, ...modelParts] = modelId.split('/')
-  const model = modelParts.join('/')
-  if (!creator || !model) return undefined
-
-  const url = `https://ai-gateway.vercel.sh/v1/models/${encodeURIComponent(creator)}/${encodeURIComponent(model)}/endpoints`
-  const response = await fetch(url, { signal })
-  if (!response.ok) return undefined
-  const body = (await response.json()) as {
-    data?: { endpoints?: Array<{ context_length?: number; status?: number }> }
-  }
-  const endpoints = body.data?.endpoints ?? []
-  const active = endpoints.filter((endpoint) => endpoint.status === 0)
-  const lengths = (active.length > 0 ? active : endpoints)
-    .map((endpoint) => endpoint.context_length)
-    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0)
-  return lengths.length > 0 ? Math.max(...lengths) : undefined
-}
-
-function ContextMeter({
-  modelId,
-  provider,
+export function ContextMeter({
+  model,
   usage,
   isRunning,
-  openaiAuthMode,
 }: {
-  modelId: string
-  provider: ProviderKind
-  /** Provider-reported only — the meter never shows a locally guessed number. */
-  usage?: Usage
+  model: ContextModel
+  usage?: ContextUsageInfo
   isRunning: boolean
-  openaiAuthMode?: Settings['openaiAuthMode']
 }): React.ReactElement {
-  const lookupId = gatewayLookupId(modelId, provider)
-  const chatgpt = provider === 'openai' && openaiAuthMode === 'chatgpt'
-  const fallback = chatgpt ? openAIContextWindow(modelId, 'chatgpt') : FALLBACK_CONTEXT_WINDOWS[modelId] ?? (lookupId ? FALLBACK_CONTEXT_WINDOWS[lookupId] : undefined)
-  const [contextWindow, setContextWindow] = useState<number | undefined>(fallback)
-  const used = tokenCount(usage)
-  const percent = used && contextWindow ? Math.min(1, used / contextWindow) : 0
+  const key = contextModelKey(model)
+  const fallback = defaultContextWindow(model)
+  const measured = contextUsageMatches(usage, model) ? usage : undefined
+  const [resolved, setResolved] = useState<{ key: string; window?: ContextWindow }>()
+  // A completed request carries the exact limit used by the harness. A late
+  // catalog response (or a previous model's state) cannot replace that limit.
+  const contextWindow = measured?.context?.window ?? (resolved?.key === key ? resolved.window : undefined) ?? fallback
+  const used = contextInputTokens(measured)
+  const percent = used !== undefined && contextWindow ? Math.min(1, used / contextWindow.tokens) : 0
   const r = 7
   const circumference = TAU * r
-  const dash = Math.max(0.4, circumference * percent)
-  const label = `${compactTokens(used)} / ${compactTokens(contextWindow)}`
-  const cached = usage?.cachedInputTokens
-  const cachedNote = cached ? ` (${cached.toLocaleString()} read from prompt cache)` : ''
-  const title =
-    used && contextWindow
-      ? `${used.toLocaleString()} tokens used out of ${contextWindow.toLocaleString()} context tokens${cachedNote}`
-      : contextWindow
-        ? `No token usage yet. Context window: ${contextWindow.toLocaleString()} tokens`
-        : 'Context window unavailable for this model'
+  const dash = circumference * percent
+  const label = `${formatContextTokens(used)} / ${contextWindow?.source === 'fallback' ? '~' : ''}${formatContextTokens(contextWindow?.tokens)}`
+  const title = contextMeterTitle(measured, contextWindow)
+  const { provider, modelId, openaiAuthMode, anthropicAuthMode, baseURL } = model
+  const measuredWindow = measured?.context?.window
 
   useEffect(() => {
-    setContextWindow(fallback)
-    if (!lookupId) return
-
+    if (measuredWindow) return
     const controller = new AbortController()
-    const request = chatgpt
-      ? listChatGPTModels().then((models) => models.find((model) => model.id === modelId.replace(/^openai\//, ''))?.contextWindow)
-      : fetchGatewayContextWindow(lookupId, controller.signal)
-    request
-      .then((value) => {
-        if (value && !controller.signal.aborted) setContextWindow(value)
+    void resolveContextWindow({ provider, modelId, openaiAuthMode, anthropicAuthMode, baseURL }, controller.signal)
+      .then((window) => {
+        if (!controller.signal.aborted) setResolved({ key, window })
       })
       .catch((err) => {
-        if (err instanceof DOMException && err.name === 'AbortError') return
-        debugLog.error('ui', 'fetch model context window', err)
+        if (!controller.signal.aborted) debugLog.error('ui', 'fetch model context window', err)
       })
     return () => controller.abort()
-  }, [fallback, lookupId, chatgpt, modelId])
+  }, [key, provider, modelId, openaiAuthMode, anthropicAuthMode, baseURL, measuredWindow])
 
   return (
     <div className={`context-meter${isRunning ? ' context-meter--running' : ''}`} title={title} aria-label={title}>
@@ -206,7 +133,7 @@ export const Header = memo(function Header({
   /** Chats with a live turn (parallel turns run concurrently). */
   runningChatIds: string[]
   settings: Settings
-  contextUsage?: { modelId: string; usage: Usage }
+  contextUsage?: ContextUsageInfo
   isRunning: boolean
   transcriptCount: number
   onNewChat: () => void
@@ -322,10 +249,8 @@ export const Header = memo(function Header({
       <div className="header__spacer" />
 
       <ContextMeter
-        modelId={settings.modelId}
-        provider={settings.provider}
-        openaiAuthMode={settings.openaiAuthMode}
-        usage={contextUsage?.modelId === settings.modelId ? contextUsage.usage : undefined}
+        model={settings}
+        usage={contextUsage}
         isRunning={isRunning}
       />
 
@@ -362,6 +287,8 @@ export const Header = memo(function Header({
         </svg>
         Files
       </button>
+
+      <ExpandView />
 
       <button className="icon-btn" onClick={() => { onOpenSettings(); setListOpen(false) }} title="Settings" aria-label="Settings">
         <SettingsIcon />

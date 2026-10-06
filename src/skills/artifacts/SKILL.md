@@ -11,27 +11,27 @@ Every `.html` artifact loads the **artifact kit**: shadcn-style CSS plus `<ai-*>
 **Write markdown, not HTML.** Kit markdown turns into polished components (tables, callouts, cards, steps, checklists, sources). A file can be only this (no `<html>`/`<head>` boilerplate needed):
 
 ```html
-<ai-doc subtitle="COURSE 101 · working draft" updated="2026-09-30T22:22:00Z" accent="violet">
-# Capital One — three responses
+<ai-doc subtitle="Project brief · working draft" updated="2026-09-30T22:22:00Z" accent="violet">
+# Example product — experiment plan
 
 ::: details How the feedback shaped this draft
-- **Credit Suisse feedback:** keep case evidence and tables.
+- **Earlier review feedback:** keep case evidence and tables.
 :::
 
 ## 1. Scientific testing
 | Stage | Application |
 |-|-|
-| Hypothesis | Predict which rates/fees appeal to a segment. |
+| Hypothesis | Predict which features appeal to a user segment. |
 
-::: note Customer intimacy
-Testing raises lifetime value, not just sign-ups.
+::: note Customer feedback
+Testing measures useful outcomes, not just sign-ups.
 :::
 
-- [ ] Paste answers into the Word doc
-- [ ] Add AI-use citation
+- [ ] Review the proposed experiment
+- [ ] Share the reviewed plan
 
 ::: sources
-- [Capital One case](https://docs.google.com/…)
+- [Example brief](https://example.com/brief)
 :::
 </ai-doc>
 ```

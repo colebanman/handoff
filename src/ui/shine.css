@@ -8,20 +8,27 @@
   );
   background-clip: text;
   -webkit-background-clip: text;
-  background-size: 220% 100%;
+  /* The gradient tiles at exactly 2× the text's width, and the sweep below
+     travels exactly one tile — so the last frame IS the first frame and the
+     loop has no seam. (It used to be a 220% tile travelling 480%: 2.18 tiles,
+     so every wrap teleported the highlight ~40% of the way across.) */
+  background-size: 200% 100%;
   -webkit-text-fill-color: transparent;
-  animation: shine 1.8s linear infinite;
+  animation: shine 2s linear infinite;
   /* Own compositor layer: the sweep repaints only this text, not the row/feed. */
   will-change: background-position;
   transform: translateZ(0);
 }
 
+/* With a 200% tile, position p offsets it by -p × width: 100% → -100% is a
+   2×-width move, one whole tile. Half the loop sweeps the highlight across
+   the text, the other half rests between sweeps. */
 @keyframes shine {
-  0% {
-    background-position: 200% 0;
+  from {
+    background-position: 100% 0;
   }
   to {
-    background-position: -200% 0;
+    background-position: -100% 0;
   }
 }
 

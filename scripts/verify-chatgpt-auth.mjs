@@ -192,11 +192,14 @@ globalThis.fetch = async (input, init = {}) => {
     assert.equal(init.cache, 'no-store')
     assert.equal(headers.get('Authorization'), `Bearer ${newAccessToken}`)
     assert.equal(headers.get('ChatGPT-Account-ID'), accountId)
-    assert.match(url, /client_version=0\.144\.0/)
+    assert.match(url, /client_version=0\.155\.1/)
     return Response.json({
       models: [
+        { slug: 'gpt-6.1-sol', display_name: 'GPT-6.1 Sol', visibility: 'list', priority: 9 },
         { slug: 'gpt-5.6-luna', display_name: 'GPT-5.6 Luna', visibility: 'list', priority: 30 },
         { slug: 'internal-hidden', display_name: 'Hidden', visibility: 'hide', priority: 1 },
+        { slug: 'gpt-6-luna', display_name: 'GPT-6 Luna', visibility: 'list', priority: 12 },
+        { slug: 'gpt-6-sol', display_name: 'GPT-6 Sol', visibility: 'list', priority: 11 },
         { slug: 'gpt-5.6-sol', display_name: 'GPT-5.6 Sol', visibility: 'list', priority: 10 },
         { slug: 'gpt-5.6-terra', display_name: 'GPT-5.6 Terra', visibility: 'list', priority: 20 },
       ],
@@ -233,7 +236,10 @@ const models = await auth.listChatGPTModels(true)
 assert.deepEqual(
   models.map(({ id, label, provider }) => ({ id, label, provider })),
   [
+    { id: 'gpt-6.1-sol', label: 'GPT-6.1 Sol', provider: 'openai' },
     { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', provider: 'openai' },
+    { id: 'gpt-6-sol', label: 'GPT-6 Sol', provider: 'openai' },
+    { id: 'gpt-6-luna', label: 'GPT-6 Luna', provider: 'openai' },
     { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra', provider: 'openai' },
     { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna', provider: 'openai' },
   ],

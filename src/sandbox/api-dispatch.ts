@@ -13,8 +13,10 @@
 import type { CdpService, TabScope, VfsEntry, VfsRoot, VirtualFileSystemService } from '../shared/types'
 import type { JsonValue } from '../shared/rpc'
 import { debugLog } from '../shared/debug-log'
+import { guardCdpOwnership, sharedSurfaceAssignments, tabSurface } from '../agent/surfaces'
 import { getNavigationTrail } from '../shared/browser-events'
 import { throwIfAborted } from '../shared/abort'
+import { formFieldsSchema } from '../shared/form-fill'
 import { supportsUrl } from '../shared/extension-matching'
 import type { ExtensionRevision } from '../shared/extensions'
 import {
@@ -37,6 +39,16 @@ export interface ApiDispatchExtras {
 }
 
 type Args = JsonValue[]
+
+// Offline agents retain local computation and VFS access. Keep this explicit
+// so new RPC capabilities do not silently grant browser or network access.
+const OFFLINE_API_PATHS = new Set([
+  'storage.get', 'storage.set',
+  'fs.list', 'fs.summary', 'fs.skills', 'fs.stat',
+  'fs.writeText', 'fs.writeBase64', 'fs.createSkill',
+  'fs.readText', 'fs.extractText', 'fs.readHtml', 'fs.readLines',
+  'fs.readBytes', 'fs.dataUrl', 'fs.search', 'fs.renderPdfPage',
+])
 
 /** Narrow a JsonValue arg to a plain object (or {} if absent/not an object). */
 function asObject(v: JsonValue | undefined): Record<string, JsonValue> {
@@ -109,11 +121,13 @@ function fsLocationFromArg(arg: JsonValue | undefined): FsLocation {
       ? arg
       : typeof q.path === 'string'
         ? q.path
-        : typeof q.prefix === 'string'
-          ? q.prefix
-          : typeof q.dir === 'string'
-            ? q.dir
-            : rootRaw
+        : typeof q.rootOrPath === 'string'
+          ? q.rootOrPath
+          : typeof q.prefix === 'string'
+            ? q.prefix
+            : typeof q.dir === 'string'
+              ? q.dir
+              : rootRaw
 
   if (!pathRaw) return {}
 
@@ -184,11 +198,9 @@ export function createApiDispatch(
   signal?: AbortSignal,
   extras?: ApiDispatchExtras,
 ): (path: string, args: JsonValue[]) => Promise<JsonValue> {
-  // Per-service-instance in-memory scratch storage (survives across exec calls
-  // for the lifetime of this dispatcher; a fresh dispatcher is created per exec
-  // by the host, so persist it on the closure the host reuses instead — but
-  // the sandbox's own `state` is the durable store, so scratch here is a
-  // best-effort convenience keyed per dispatcher).
+  const ownerId = scope?.surfaceOwnerId ?? scope?.agentId
+  cdp = guardCdpOwnership(cdp, ownerId)
+  // New dispatchers in the same sandbox session retain their own scratch KV.
   const scratch = storageFor(scope)
   const extensionRevisions = { ...scope?.extensionRevisions }
 
@@ -197,6 +209,7 @@ export function createApiDispatch(
     if (scope?.allowedTabIds && !scope.allowedTabIds.includes(tabId)) {
       throw new Error(`tab ${tabId} not in this agent's scope`)
     }
+    if (ownerId) sharedSurfaceAssignments().beginUse(ownerId, [tabSurface(tabId)])()
   }
 
   /** Throw for operations that can affect tabs outside a subagent's scope. */
@@ -204,6 +217,17 @@ export function createApiDispatch(
     if (scope?.allowedTabIds) {
       throw new Error(`${op} is not available to tab-scoped subagents`)
     }
+  }
+
+  async function withOwnedTabs<T>(ids: number[], operation: () => Promise<T>): Promise<T> {
+    for (const id of ids) requireScope(id)
+    const release = ownerId ? sharedSurfaceAssignments().beginUse(ownerId, ids.map(tabSurface)) : () => {}
+    try { return await operation() } finally { release() }
+  }
+
+  async function withOwnedGroup<T>(groupId: number, operation: () => Promise<T>): Promise<T> {
+    const tabs = await chrome.tabs.query({ groupId })
+    return withOwnedTabs(tabs.flatMap(tab => tab.id === undefined ? [] : [tab.id]), operation)
   }
 
   /** Resolve an optional tabId arg to a concrete, in-scope tab. */
@@ -346,6 +370,9 @@ export function createApiDispatch(
   }
 
   async function handle(path: string, args: Args): Promise<JsonValue> {
+    if (scope?.offlineOnly && !OFFLINE_API_PATHS.has(path)) {
+      throw new Error(`api.${path} is unavailable to offline-only subagents; use local api.fs operations or api.storage`)
+    }
     if (path.startsWith('extensions.')) {
       const operation = path.slice('extensions.'.length), input = asObject(args[0])
       if (!['list', 'get', 'resolve'].includes(operation)) requireUnscoped('api.extensions.' + operation)
@@ -437,8 +464,10 @@ export function createApiDispatch(
         const activate = async (): Promise<void> => {
           tab = await chrome.tabs.update(id, { active: true })
         }
-        if (cdp.switchTabs) await cdp.switchTabs({ toTab: id, signal, activate })
-        else await activate()
+        await withOwnedTabs([id], async () => {
+          if (cdp.switchTabs) await cdp.switchTabs({ toTab: id, signal, activate })
+          else await activate()
+        })
         scope?.setCurrentTabId?.(id)
         return toJson(tab ? summarizeTab(tab) : { id, activated: true })
       }
@@ -448,13 +477,13 @@ export function createApiDispatch(
           const ids = asTabIdArray(args[0])
           for (const id of ids) requireScope(id)
           throwIfAborted(signal)
-          await chrome.tabs.remove(ids)
+          await withOwnedTabs(ids, () => chrome.tabs.remove(ids))
           await forgetClosedTabs(ids)
           return toJson({ ids, closed: true })
         }
         const id = await resolveTabId(args[0])
         throwIfAborted(signal)
-        await chrome.tabs.remove(id)
+        await withOwnedTabs([id], () => chrome.tabs.remove(id))
         await forgetClosedTabs([id])
         return toJson({ id, closed: true })
       }
@@ -464,12 +493,14 @@ export function createApiDispatch(
         const q = asObject(args[0])
         const tabIds = asTabIdArray(Array.isArray(args[0]) ? args[0] : q.tabIds)
         for (const id of tabIds) requireScope(id)
-        const groupId = typeof q.groupId === 'number' ? q.groupId : undefined
+        // Accept a prior tabs.group result as well as its numeric groupId;
+        // never silently create a different group for an invalid supplied id.
+        const groupId = q.groupId === undefined ? undefined : asGroupId(q.groupId)
         throwIfAborted(signal)
-        const gid = await chrome.tabs.group({
+        const gid = await withOwnedTabs(tabIds, () => chrome.tabs.group({
           tabIds: tabIds as [number, ...number[]],
           ...(groupId !== undefined ? { groupId } : {}),
-        })
+        }))
         return toJson({ groupId: gid, tabIds })
       }
       case 'tabs.ungroup': {
@@ -480,7 +511,7 @@ export function createApiDispatch(
         )
         for (const id of tabIds) requireScope(id)
         throwIfAborted(signal)
-        await chrome.tabs.ungroup(tabIds as [number, ...number[]])
+        await withOwnedTabs(tabIds, () => chrome.tabs.ungroup(tabIds as [number, ...number[]]))
         return toJson({ ungrouped: tabIds })
       }
       case 'tabs.move': {
@@ -488,10 +519,10 @@ export function createApiDispatch(
         const id = await resolveTabId(args[0])
         const q = asObject(args[1])
         throwIfAborted(signal)
-        const tab = await chrome.tabs.move(id, {
+        const tab = await withOwnedTabs([id], () => chrome.tabs.move(id, {
           index: typeof q.index === 'number' ? q.index : -1,
           ...(typeof q.windowId === 'number' ? { windowId: q.windowId } : {}),
-        })
+        }))
         return toJson(summarizeTab(tab))
       }
 
@@ -535,7 +566,7 @@ export function createApiDispatch(
         if (typeof q.color === 'string') props.color = q.color as chrome.tabGroups.Color
         if (typeof q.collapsed === 'boolean') props.collapsed = q.collapsed
         throwIfAborted(signal)
-        const group = await chrome.tabGroups.update(gid, props)
+        const group = await withOwnedGroup(gid, () => chrome.tabGroups.update(gid, props))
         return toJson(group ? summarizeGroup(group) : { id: gid, updated: true })
       }
       case 'tabGroups.move': {
@@ -543,10 +574,10 @@ export function createApiDispatch(
         const gid = asGroupId(args[0])
         const q = asObject(args[1])
         throwIfAborted(signal)
-        const group = await chrome.tabGroups.move(gid, {
+        const group = await withOwnedGroup(gid, () => chrome.tabGroups.move(gid, {
           index: typeof q.index === 'number' ? q.index : -1,
           ...(typeof q.windowId === 'number' ? { windowId: q.windowId } : {}),
-        })
+        }))
         return toJson(group ? summarizeGroup(group) : { id: gid, moved: true })
       }
 
@@ -651,6 +682,9 @@ export function createApiDispatch(
           offset: typeof q.offset === 'number' ? q.offset : undefined,
           maxChars: typeof q.maxChars === 'number' ? q.maxChars : undefined,
         })
+        if (result.truncated && q.maxChars === undefined) {
+          throw new Error(`File ${pathArg} has ${result.totalChars} characters; the default read would return only ${result.text.length}. Use api.fs.extractText(path, {offset, maxChars}) and paginate until truncated is false, or pass maxChars explicitly for an intentional excerpt.`)
+        }
         return toJson(result.text)
       }
       case 'fs.extractText': {
@@ -699,10 +733,10 @@ export function createApiDispatch(
         const maxResults = typeof q.maxResults === 'number' ? q.maxResults : undefined
         const results = await vfs.search(query, {
           root: location.root,
-          maxResults: location.prefix ? Math.max(maxResults ?? 20, 200) : maxResults,
+          prefix: location.prefix,
+          maxResults,
         })
-        const filtered = location.prefix ? results.filter((result) => isPathUnderPrefix(result.path, location.prefix)) : results
-        return toJson(filtered.slice(0, maxResults ?? filtered.length))
+        return toJson(results)
       }
       case 'fs.importUrl': {
         const urlArg = typeof args[0] === 'string' ? args[0] : asString(asObject(args[0]).url, 'url')
@@ -867,6 +901,22 @@ export function createApiDispatch(
         })
         return toJson({ ok: true })
       }
+      case 'page.fill': {
+        const hasTab = typeof args[0] === 'number' || args[0] == null
+        const tabId = await resolveTabId(hasTab ? args[0] : undefined)
+        const fields = formFieldsSchema.parse(args[hasTab ? 1 : 0])
+        throwIfAborted(signal)
+        return toJson(await cdp.fill(tabId, fields, signal))
+      }
+      case 'page.select': {
+        const hasTab = typeof args[0] === 'number' || args[0] == null
+        const tabId = await resolveTabId(hasTab ? args[0] : undefined)
+        const offset = hasTab ? 1 : 0
+        const ref = asString(args[offset], 'ref'), option = asString(args[offset + 1], 'option')
+        formFieldsSchema.parse([{ ref, select: option }])
+        throwIfAborted(signal)
+        return toJson(await cdp.select(tabId, ref, option, signal))
+      }
       case 'page.pressKey': {
         const tabId = await resolveTabId(args[0])
         const key = asString(args[1], 'key')
@@ -925,7 +975,9 @@ export function createApiDispatch(
           }
         `
         throwIfAborted(signal)
-        return toJson(await cdp.evalInPage(tabId, expr, { statement: true, signal }))
+        const result = await cdp.evalInPage<{ binary?: boolean; error?: string }>(tabId, expr, { statement: true, signal })
+        if (result?.binary) throw new Error(result.error ?? 'page.fetch is text-only; use api.fs.importUrl for binary files')
+        return toJson(result)
       }
       case 'page.screenshotToLog': {
         // Screenshots go through the dedicated browser_screenshot tool (they are
@@ -1258,13 +1310,9 @@ function sanitizeFetchInit(init: Record<string, JsonValue>): RequestInit {
   return out
 }
 
-/**
- * Best-effort scratch store keyed per scope object. Dispatchers created for the
- * same scope share a store; unscoped (main-agent) dispatchers share a single
- * global store. This gives sandbox `api.storage` a stable place to stash small
- * values across exec calls without touching chrome.storage.
- */
-const globalScratch = new Map<string, JsonValue>()
+/** Scratch follows the same session boundary as sandbox state. Artifact and
+ * other unscoped dispatchers get private stores, never a main-agent global. */
+const sessionScratch = new Map<string, Map<string, JsonValue>>()
 const scopedScratch = new WeakMap<TabScope, Map<string, JsonValue>>()
 
 /** Fetched module source, cached by URL for the panel's lifetime (api.require). */
@@ -1272,7 +1320,12 @@ const moduleSourceCache = new Map<string, Promise<string>>()
 const MAX_MODULE_SOURCE_CHARS = 5_000_000
 
 function storageFor(scope?: TabScope): Map<string, JsonValue> {
-  if (!scope || scope.allowedTabIds === undefined) return globalScratch
+  if (scope?.sessionId) {
+    let store = sessionScratch.get(scope.sessionId)
+    if (!store) { store = new Map(); sessionScratch.set(scope.sessionId, store) }
+    return store
+  }
+  if (!scope) return new Map()
   let store = scopedScratch.get(scope)
   if (!store) {
     store = new Map<string, JsonValue>()

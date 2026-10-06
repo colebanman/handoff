@@ -35,8 +35,8 @@
  */
 import type { Element, ElementContent, Root, RootContent, Text } from 'hast'
 
-/** Subtrees whose text belongs to rehype-highlight, not to us. */
-const OPAQUE_TAGS = new Set(['pre', 'code'])
+/** Highlighting and math layout own their subtrees, including accessible MathML. */
+const OPAQUE_TAGS = new Set(['pre', 'code', 'math', 'svg'])
 
 /** Splits into words and the whitespace runs between them, both preserved. */
 const TOKENS = /(\s+)/
@@ -52,8 +52,15 @@ function word(value: string): Element {
 
 /**
  * Expands one text node into alternating word elements and whitespace text
- * nodes. Returns a single-node list unchanged when there is nothing to split
- * (pure whitespace, or a lone word) so the common case adds no garbage.
+ * nodes. Pure whitespace comes back as the same node, untouched.
+ *
+ * A LONE word is wrapped too. It used to be left as plain text ("nothing to
+ * split"), which is exactly the state of every paragraph, list item, bold run,
+ * link and table cell while its first word is streaming — so that word painted
+ * at full opacity, and when the second word arrived the text node was
+ * replaced by a brand-new span whose fade started from 0: the word blinked out
+ * and faded back in. Wrapped from its first frame, it keeps the same span (and
+ * the same key) for the rest of the stream, and fades exactly once.
  */
 function splitText(node: Text): Array<Element | Text> {
   if (node.value.trim() === '') return [node]
@@ -75,7 +82,7 @@ function walk(children: Array<RootContent | ElementContent>): void {
     const child = children[i]!
     if (child.type === 'text') {
       const parts = splitText(child)
-      if (parts.length !== 1) {
+      if (parts.length !== 1 || parts[0] !== child) {
         children.splice(i, 1, ...parts)
         i += parts.length - 1
       }
@@ -83,6 +90,8 @@ function walk(children: Array<RootContent | ElementContent>): void {
     }
     if (child.type !== 'element') continue
     if (OPAQUE_TAGS.has(child.tagName)) continue
+    const classes = child.properties.className
+    if (Array.isArray(classes) && classes.some((name) => ['katex', 'katex-display', 'katex-error'].includes(String(name)))) continue
     walk(child.children)
   }
 }

@@ -49,11 +49,13 @@ import {
   hasXaiKey,
   hasActiveCredential,
   isOpenAIModel,
+  isClaudeModel,
   setChatGPTConnectionStatus,
+  setClaudeConnectionStatus,
   availableModelProviders,
   resolveStarterPrompts,
   registerFileViewer,
-  attachImageFiles,
+  attachFiles,
   removeAttachment,
   removeBrowserContext,
   captureAppshot,
@@ -61,7 +63,7 @@ import {
   nudgeTask,
   cancelTask,
 } from './store'
-import type { Settings as SettingsShape } from '../shared/types'
+import { pinnedSettingsForModel, type Settings as SettingsShape } from '../shared/types'
 
 /** Draft syntax for "read this file" — the file panel's Attach button emits it. */
 const fileMention = (path: string): string => `@file(${path})`
@@ -73,13 +75,14 @@ const onModelChange = (id: string): void => void setModelId(id)
 const onSend = (text: string): void => void sendMessage(text)
 const onNudgeTask = (taskId: string, text: string): void => nudgeTask(taskId, text)
 const onCancelTask = (taskId: string): void => cancelTask(taskId)
-const onAttachFiles = (files: File[]): void => void attachImageFiles(files)
+const onAttachFiles = (files: File[]): void => void attachFiles(files)
 const onAppshot = (): void => void captureAppshot()
 const onSaveSettings = (next: SettingsShape): Promise<void> => saveSettings(next)
 const onStepPromptAnswer = (keepGoing: boolean): void => answerStepPrompt(keepGoing)
 const onRetryDeadTurn = (): void => void retryDeadTurn()
 const onSwitchToGrok = (scope: 'all' | 'subagents'): void => void switchToGrok(scope)
 const onChatGPTConnectionChange = (connected: boolean): void => setChatGPTConnectionStatus(connected)
+const onClaudeConnectionChange = (connected: boolean): void => setClaudeConnectionStatus(connected)
 const attachFile = (path: string, opts?: { folder?: boolean }): void =>
   appendDraftMention(opts?.folder ? `@folder(${path})` : fileMention(path))
 
@@ -91,7 +94,7 @@ export function App(): React.ReactElement {
   const [dropActive, setDropActive] = useState(false)
   const dragDepth = useRef(0)
 
-  // Panel-wide image drop target. Depth-counted enter/leave so crossing child
+  // Panel-wide file drop target. Depth-counted enter/leave so crossing child
   // elements doesn't flicker the overlay; only OS file drags activate it.
   const dragHasFiles = (e: React.DragEvent): boolean => Array.from(e.dataTransfer?.types ?? []).includes('Files')
   const onDragEnter = (e: React.DragEvent): void => {
@@ -120,7 +123,7 @@ export function App(): React.ReactElement {
     dragDepth.current = 0
     setDropActive(false)
     const files = Array.from(e.dataTransfer.files)
-    if (files.length > 0) void attachImageFiles(files)
+    if (files.length > 0) void attachFiles(files)
   }
 
   // Safety net for drags that end outside the panel (dropped elsewhere,
@@ -175,7 +178,10 @@ export function App(): React.ReactElement {
   const queuedMessages = state.queuedMessages.filter((message) => message.chatId === state.current.id)
   const isRunning = state.runningChatIds.includes(state.current.id)
   const compacting = isRunning && isCompacting(state.current.transcript)
-  const contextUsage = state.contextUsage[state.current.id]
+  const contextUsage = state.contextUsage[state.current.id] ?? state.current.contextUsage
+  const contextSettings = useMemo(() => state.current.modelId === state.settings.modelId
+    ? state.settings : pinnedSettingsForModel(state.current.modelId, state.settings, { pinEndpoint: true }),
+  [state.current.modelId, state.settings])
   // Per-agent rate-limit waits: main's feeds the banner; subagent entries are
   // rendered under their delegation cards in the feed.
   const chatRateLimits = state.rateLimits[state.current.id]
@@ -207,7 +213,7 @@ export function App(): React.ReactElement {
   const modelProviders = useMemo(
     () => availableModelProviders(),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [state.settings, state.chatgptConnected],
+    [state.settings, state.chatgptConnected, state.claudeConnected],
   )
 
   const chatTasks = useMemo(
@@ -218,12 +224,6 @@ export function App(): React.ReactElement {
   // Stable array identity per setup record, so the empty-state chips don't
   // re-create their handlers on unrelated renders.
   const starterPrompts = useMemo(() => resolveStarterPrompts(state.setup), [state.setup])
-
-  // Stable identity so the memoized Header only re-renders when usage moves.
-  const headerUsage = useMemo(
-    () => (contextUsage ? { modelId: contextUsage.modelId, usage: contextUsage.usage } : undefined),
-    [contextUsage],
-  )
 
   // Stream jitter buffer: slice the still-arriving part back to what has been
   // revealed and withhold whatever the model produced after it, so bursts and
@@ -271,8 +271,8 @@ export function App(): React.ReactElement {
         chats={state.chats}
         currentId={state.current.id}
         runningChatIds={state.runningChatIds}
-        settings={state.settings}
-        contextUsage={headerUsage}
+        settings={contextSettings}
+        contextUsage={contextUsage}
         isRunning={isRunning}
         transcriptCount={state.current.transcript.length}
         onNewChat={newChat}
@@ -287,7 +287,9 @@ export function App(): React.ReactElement {
           <span>
             {isOpenAIModel(state.current.modelId) && state.settings.openaiAuthMode === 'chatgpt'
               ? 'ChatGPT sign-in required.'
-              : 'No API key set.'}
+              : isClaudeModel(state.current.modelId) && (state.settings.anthropicAuthMode ?? 'claude') === 'claude'
+                ? 'Claude sign-in required.'
+                : 'No API key set.'}
           </span>
           <button onClick={openSettings}>Open Settings</button>
           <span>to start chatting.</span>
@@ -295,6 +297,7 @@ export function App(): React.ReactElement {
       ) : null}
 
       <Feed
+        key={`feed-${state.current.id}`}
         items={feedItems}
         streaming={isRunning || revealing}
         agentWaits={chatRateLimits}
@@ -350,15 +353,19 @@ export function App(): React.ReactElement {
       />
 
       <Composer
+        key={`composer-${state.current.id}`}
         value={composerDraft}
         isRunning={isRunning}
         disabled={!hasCredential || configuring || compacting}
-        disabledReason={compacting ? 'Compacting conversation…' : configuring ? 'We’re still configuring Handoff for you…' : undefined}
+        disabledReason={compacting ? 'Compacting conversation…' : configuring ? 'We’re still configuring Handoff for you…'
+          : !hasCredential && isClaudeModel() && (state.settings.anthropicAuthMode ?? 'claude') === 'claude'
+            ? 'Sign in with Claude in Settings to start…' : undefined}
         queuedCount={queuedMessages.length}
         pendingSteering={pendingSteering}
         modelId={state.current.modelId}
         provider={state.settings.provider}
         openaiAuthMode={state.settings.openaiAuthMode}
+        anthropicAuthMode={state.settings.anthropicAuthMode}
         modelProviders={modelProviders}
         attachments={pendingAttachments}
         browserContexts={pendingBrowserContexts}
@@ -384,7 +391,7 @@ export function App(): React.ReactElement {
 
       {dropActive ? (
         <div className="drop-overlay" aria-hidden="true">
-          <div className="drop-overlay__card">Drop images to attach</div>
+          <div className="drop-overlay__card">Drop files to attach</div>
         </div>
       ) : null}
 
@@ -395,6 +402,7 @@ export function App(): React.ReactElement {
           onSave={onSaveSettings}
           onClose={closeSettings}
           onChatGPTConnectionChange={onChatGPTConnectionChange}
+          onClaudeConnectionChange={onClaudeConnectionChange}
         />
       ) : null}
 

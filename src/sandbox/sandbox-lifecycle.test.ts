@@ -33,6 +33,14 @@ afterEach(async () => {
 })
 
 describe('persistent sandbox helpers', () => {
+  it('isolates legacy global aliases between chats and keeps them within one session', async () => {
+    await exec('write-a', 'globalThis.auditValue = "chat A"; window.anotherValue = 42;', 'a')
+    const other = await exec('read-b', 'return {value:globalThis.auditValue ?? null, other:self.anotherValue ?? null}', 'b')
+    expect(JSON.parse(other!.value!)).toEqual({ value: null, other: null })
+    const own = await exec('read-a', 'return {value:window.auditValue, other:globalThis.anotherValue}', 'a')
+    expect(JSON.parse(own!.value!)).toEqual({ value: 'chat A', other: 42 })
+    expect((await exec('implicit', 'auditUndeclaredGlobal = 123;', 'a'))?.ok).toBe(false)
+  })
   it.each([
     ['state.getCanvas = async path => api.fetch(path);', 'await state.getCanvas("/courses")'],
     ['state.fetch = api.fetch;', 'await state.fetch("/courses")'],

@@ -26,7 +26,7 @@ import { streamText } from 'ai'
 import { type NextPromptFeedback, type Settings, type VirtualFileSystemService } from '../shared/types'
 import { debugLog } from '../shared/debug-log'
 import { resolveModel, resolveModelAccess } from './models'
-import { readMemory, serializeMemoryForPrompt } from './memory'
+import { personalizationMemory } from './continuity-personalization'
 
 /** Cheapest tier in the family; this is a one-line stylistic guess, not analysis. */
 export const NEXT_PROMPT_MODEL_ID = 'gpt-5.6-luna'
@@ -131,7 +131,7 @@ async function attempt(
   if (signal.aborted) return undefined
   const model = resolveModel(access.settings, access.chatgptCredentials)
 
-  const memory = serializeMemoryForPrompt(await readMemory(vfs))
+  const memory = await personalizationMemory(vfs, `${input.userMessages.join('\n')}\n${final}`)
   if (signal.aborted) return undefined
 
   // MUST stream: the ChatGPT Codex endpoint rejects non-streaming requests with

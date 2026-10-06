@@ -19,6 +19,43 @@ function chunks(parts: StreamPart[]) {
 afterEach(() => vi.useRealTimers())
 
 describe('model stream lifecycle', () => {
+  it('times out endless whitespace after tool arguments without executing or replaying the tool', async () => {
+    vi.useFakeTimers()
+    const execute = vi.fn(async () => 'done')
+    const cancel = vi.fn()
+    const model = new MockLanguageModelV3({ doStream: async () => {
+      let timer: ReturnType<typeof setInterval>
+      return { stream: new ReadableStream<StreamPart>({
+        start(c) {
+          c.enqueue({ type: 'tool-input-start', id: 'stuck', toolName: 'read' })
+          c.enqueue({ type: 'tool-input-delta', id: 'stuck', delta: '{"code":"return 1"}' })
+          timer = setInterval(() => c.enqueue({ type: 'tool-input-delta', id: 'stuck', delta: ' \n' }), 20)
+        },
+        cancel() { clearInterval(timer); cancel() },
+      }) }
+    } })
+    const errors: unknown[] = []
+    const result = streamText({
+      model: withRateLimitRetry(wrap(model)), prompt: 'Read courses.', maxRetries: 0,
+      tools: { read: tool({ inputSchema: z.object({ code: z.string() }), execute }) },
+      onError: ({ error }) => { errors.push(error) },
+    })
+    const consumed = (async () => {
+      try {
+        for await (const part of result.fullStream) {
+          if (part.type === 'error') errors.push(part.error)
+        }
+      } catch (error) { errors.push(error) }
+    })()
+    await vi.advanceTimersByTimeAsync(150)
+    await consumed
+    expect(errors).toContainEqual(expect.any(ModelIdleTimeoutError))
+    expect(execute).not.toHaveBeenCalled()
+    expect(model.doStreamCalls).toHaveLength(1)
+    expect(cancel).toHaveBeenCalledOnce()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it('retries a metadata-only stream once, then fails instead of waiting forever', async () => {
     vi.useFakeTimers()
     const model = new MockLanguageModelV3({ doStream: async () => {

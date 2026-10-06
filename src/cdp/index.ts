@@ -5,7 +5,8 @@
 
 import type { CdpService } from '../shared/types'
 import { CdpServiceImpl } from './service'
+import { guardFormActions } from './form-gate'
 
 export function createCdpService(): CdpService {
-  return new CdpServiceImpl()
+  return guardFormActions(new CdpServiceImpl())
 }

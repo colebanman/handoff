@@ -28,6 +28,8 @@ function setup() {
       { nodeId: 'button', role: { value: 'button' }, name: { value: 'Open details' }, backendDOMNodeId: 42 },
     ] }
     if (method === 'DOM.getContentQuads') return { quads: [[10, 20, 30, 20, 30, 40, 10, 40]] }
+    if (method === 'DOM.resolveNode') return { object: { objectId: 'button-42' } }
+    if (method === 'Runtime.callFunctionOn') return { result: { value: true } }
     return {}
   })
   const services = createBackgroundRuntimeServices(cdp, async () => {})

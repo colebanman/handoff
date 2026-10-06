@@ -6,6 +6,9 @@ describe('subagent model routing', () => {
     ['gpt-6-astra', 'gpt-5.6-sol'],
     ['openai/gpt-6-astra', 'openai/gpt-5.6-sol'],
     [' GPT-6-ASTRA ', 'gpt-5.6-sol'],
+    ['gpt-6.1-sol', 'gpt-6.1-sol'],
+    ['gpt-6-sol', 'gpt-6-sol'],
+    ['gpt-6-luna', 'gpt-6-luna'],
     ['gpt-5.6-sol', 'gpt-5.6-terra'],
     ['gpt-5.6-terra', 'gpt-5.6-luna'],
     ['gpt-5.6-luna', 'gpt-5.6-luna'],
@@ -107,6 +110,25 @@ describe('surface claims', () => {
 describe('main-agent soft claims', () => {
   const firstTab = tabSurface(1)
 
+  it('rejects actual operations on another agent tab before invoking the browser', () => {
+    const surfaces = createSurfaceAssignments()
+    surfaces.claim('sub-a', [1])
+    expect(() => surfaces.beginUse('main:chat-b', [firstTab])).toThrow('no action was dispatched')
+    expect(surfaces.ownerOf(firstTab)).toBe('sub-a')
+  })
+
+  it('keeps in-flight operations owned past the idle TTL and prevents mid-operation handoff', () => {
+    let now = 0
+    const surfaces = createSurfaceAssignments({ now: () => now, softTtlMs: 100 })
+    const release = surfaces.beginUse('main:chat-a', [firstTab])
+    now = 1000
+    expect(() => surfaces.beginUse('main:chat-b', [firstTab])).toThrow('owned')
+    expect(surfaces.claimSurfaces('sub-a', [firstTab], { handoffFromAgentId: 'main:chat-a' })).toBeDefined()
+    release()
+    expect(surfaces.claimSurfaces('sub-a', [firstTab], { handoffFromAgentId: 'main:chat-a' })).toBeUndefined()
+    expect(surfaces.ownerOf(firstTab)).toBe('sub-a')
+  })
+
   it('yields to a subagent instead of failing, and reports the granted subset', () => {
     const surfaces = createSurfaceAssignments()
     surfaces.claimSurfaces('sub-a', [firstTab])
@@ -119,6 +141,32 @@ describe('main-agent soft claims', () => {
     surfaces.softClaim('main', [firstTab])
     const conflict = surfaces.claimSurfaces('sub-a', [firstTab])
     expect(conflict).toMatchObject({ ownerAgentId: 'main', soft: true })
+  })
+
+  it('hands the parent soft claim to a delegated child without waiting for expiry', () => {
+    const surfaces = createSurfaceAssignments()
+    surfaces.softClaim('main', [firstTab, tabSurface(2)])
+    expect(surfaces.claimSurfaces('sub-a', [firstTab], { handoffFromAgentId: 'main' })).toBeUndefined()
+    expect(surfaces.list().find((claim) => claim.surface.tabId === 1)).toMatchObject({ ownerAgentId: 'sub-a', soft: false })
+    expect(surfaces.ownerOf(tabSurface(2))).toBe('main')
+    expect(surfaces.claimSurfaces('sub-b', [firstTab], { handoffFromAgentId: 'main' })).toMatchObject({ ownerAgentId: 'sub-a', soft: false })
+  })
+
+  it('preserves every parent claim when a different assigned tab conflicts', () => {
+    const surfaces = createSurfaceAssignments()
+    surfaces.softClaim('main', [firstTab])
+    surfaces.claimSurfaces('sub-other', [tabSurface(2)])
+    expect(surfaces.claimSurfaces('sub-a', [firstTab, tabSurface(2)], { handoffFromAgentId: 'main' })).toMatchObject({ ownerAgentId: 'sub-other' })
+    expect(surfaces.ownerOf(firstTab)).toBe('main')
+    expect(surfaces.surfacesOf('sub-a')).toEqual([])
+  })
+
+  it('does not transfer another agent soft claim or even its own parent hard claim', () => {
+    const surfaces = createSurfaceAssignments()
+    surfaces.softClaim('main-other', [firstTab])
+    expect(surfaces.claimSurfaces('sub-a', [firstTab], { handoffFromAgentId: 'main' })).toMatchObject({ ownerAgentId: 'main-other', soft: true })
+    surfaces.claimSurfaces('parent', [tabSurface(2)])
+    expect(surfaces.claimSurfaces('sub-a', [tabSurface(2)], { handoffFromAgentId: 'parent' })).toMatchObject({ ownerAgentId: 'parent', soft: false })
   })
 
   it('expires on its own so an abandoned turn cannot strand a surface', () => {

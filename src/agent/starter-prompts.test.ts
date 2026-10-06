@@ -66,8 +66,8 @@ describe('starter-prompts padStarterPrompts', () => {
  */
 describe('starter-prompts parsePrompts', () => {
   it('parses a clean object', () => {
-    expect(parsePrompts('{"prompts":["Check my Example College assignments","Open my Supabase SQL editor"]}')).toEqual([
-      'Check my Example College assignments',
+    expect(parsePrompts('{"prompts":["Check my College assignments","Open my Supabase SQL editor"]}')).toEqual([
+      'Check my College assignments',
       'Open my Supabase SQL editor',
     ])
   })

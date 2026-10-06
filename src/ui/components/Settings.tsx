@@ -2,8 +2,8 @@
  * Settings modal over ONE local draft: every control edits local state and only
  * Save persists, so opening Settings can never disturb chats.
  *
- * Five groups, in the order people reach for them — Account, Behavior,
- * Prompt, Automations, Theme. Tab order lives in `settings-sections.ts`.
+ * Six groups — Account, Behavior, Prompt, Memory, Automations, Theme.
+ * Tab order lives in `settings-sections.ts`.
  *
  * Rules the body follows (DESIGN.md): one control per row, label left and
  * control right, at most one summary line per group, no explanatory paragraphs.
@@ -17,9 +17,12 @@
  */
 import { useEffect, useState } from 'react'
 import { AutomationsPanel } from './Automations'
+import { MemoriesPanel } from './Memories'
 import { BRIDGE_DEFAULT_PORT } from '../../shared/bridge-protocol'
 import {
   isOpenAIModelId,
+  isAnthropicModelId,
+  ANTHROPIC_DEFAULT_MODEL_ID,
   CEREBRAS_DEFAULT_MODEL_ID,
   MODEL_OPTIONS,
   OPENAI_DEFAULT_MODEL_ID,
@@ -40,10 +43,10 @@ import {
 import { debugLog } from '../../shared/debug-log'
 import { DEV_BUILD, devFreshReset } from '../../shared/dev-reset'
 import { formatError } from '../../shared/errors'
-import { openMemoryFile, replayOnboarding, rerunOnboardingSetup, useStore } from '../store'
-import { SITE_MEMORY_PATH } from '../../agent/site-memory'
+import { hasOnboardingSetupCredential, replayOnboarding, rerunOnboardingSetup, useStore } from '../store'
 import { openStreamInspector as openInspectorWindow } from '../../shared/stream-inspector'
 import { ChatGPTAccount } from './ChatGPTAccount'
+import { ClaudeAccount } from './ClaudeAccount'
 import { activityCursorMode } from '../../storage/settings'
 import {
   resolveSection,
@@ -72,7 +75,8 @@ function directProviderFor(modelId: string, prev: ProviderKind): ProviderKind {
   const curated = MODEL_OPTIONS.find((m) => m.id === modelId)
   if (curated) return curated.provider
   if (isOpenAIModelId(modelId)) return 'openai'
-  if (prev === 'openai' || prev === 'xai' || prev === 'cerebras') return prev
+  if (isAnthropicModelId(modelId)) return 'anthropic'
+  if (prev === 'openai' || prev === 'xai' || prev === 'cerebras' || prev === 'anthropic') return prev
   return modelId.trim().toLowerCase().startsWith('grok') ? 'xai' : 'openai'
 }
 
@@ -81,6 +85,7 @@ export function Settings({
   onSave,
   onClose,
   onChatGPTConnectionChange,
+  onClaudeConnectionChange,
   initialSection,
 }: {
   settings: Settings
@@ -88,6 +93,7 @@ export function Settings({
   onSave: (next: Settings) => void | Promise<void>
   onClose: () => void
   onChatGPTConnectionChange: (connected: boolean) => void
+  onClaudeConnectionChange: (connected: boolean) => void
 }): React.ReactElement {
   const tabs = SETTINGS_SECTIONS
   const [section, setSection] = useState<SectionId>(() => resolveSection(initialSection))
@@ -95,9 +101,9 @@ export function Settings({
   // The re-run button gates on PERSISTED auth, not the unsaved form draft: the
   // pass reads whatever is actually stored, so offering it on a draft the user
   // hasn't saved would just produce a silent no-op.
-  // Either OpenAI credential can run the pass; only the provider has to match.
-  const canRunSetup = settings.provider === 'openai'
-  const setupRunning = useStore().setup.status === 'running'
+  const uiState = useStore()
+  const canRunSetup = hasOnboardingSetupCredential(settings, uiState.chatgptConnected, uiState.claudeConnected)
+  const setupRunning = uiState.setup.status === 'running'
   const [routing, setRouting] = useState<Routing>(
     settings.provider === 'gateway' || settings.provider === 'openai-compatible'
       ? settings.provider
@@ -109,11 +115,12 @@ export function Settings({
     settings.provider === 'gateway' || settings.provider === 'openai-compatible',
   )
   const [behaviorAdvanced, setBehaviorAdvanced] = useState(false)
-  const [typeSafeEnabled, setTypeSafeEnabled] = useState(settings.typeSafeEnabled === true)
-  const [typeSafeApiKey, setTypeSafeApiKey] = useState(settings.typeSafeApiKey ?? '')
   const [promptAdvanced, setPromptAdvanced] = useState(false)
   const [openaiAuthMode, setOpenaiAuthMode] = useState<'api-key' | 'chatgpt'>(
     settings.openaiAuthMode ?? 'api-key',
+  )
+  const [anthropicAuthMode, setAnthropicAuthMode] = useState<'claude' | 'api-key'>(
+    settings.anthropicAuthMode ?? 'claude',
   )
   const [apiKeys, setApiKeys] = useState<Partial<Record<ProviderKind, string>>>(() => ({
     ...(settings.apiKey ? { [settings.provider]: settings.apiKey } : {}),
@@ -172,15 +179,15 @@ export function Settings({
       ...settings,
       provider,
       openaiAuthMode,
-      apiKey: provider === 'openai' && openaiAuthMode === 'chatgpt' ? '' : (keys[provider] ?? ''),
+      anthropicAuthMode,
+      apiKey: (provider === 'openai' && openaiAuthMode === 'chatgpt') ||
+        (provider === 'anthropic' && anthropicAuthMode === 'claude') ? '' : (keys[provider] ?? ''),
       apiKeys: keys,
       // Model choice lives in the composer picker; this only re-normalizes
       // vendor prefixes when the ROUTE changed under the same model.
       modelId: resolveModelId(settings.modelId, provider),
       theme,
       activityCursor,
-      typeSafeEnabled,
-      typeSafeApiKey: typeSafeApiKey.trim() || undefined,
       notifyOnLongTurn,
       baseURL: routing === 'openai-compatible' && baseURL.trim() ? baseURL.trim() : undefined,
       customInstructions: customInstructions.trim() || undefined,
@@ -258,6 +265,34 @@ export function Settings({
                     value={apiKeys.openai ?? ''}
                     onChange={(v) => setKey('openai', v)}
                     provision="openai"
+                  />
+                )}
+              </CredentialGroup>
+
+              <CredentialGroup name="Anthropic (Claude)" active={activeDirect === 'anthropic'}>
+                <Row label="Sign in with">
+                  <select
+                    aria-label="Anthropic authentication"
+                    value={anthropicAuthMode}
+                    onChange={(event) => setAnthropicAuthMode(event.target.value as 'claude' | 'api-key')}
+                  >
+                    <option value="claude">Claude subscription</option>
+                    <option value="api-key">API key</option>
+                  </select>
+                </Row>
+                {anthropicAuthMode === 'claude' ? (
+                  <div className="field">
+                    <ClaudeAccount
+                      onConnected={() => onClaudeConnectionChange(true)}
+                      onDisconnected={() => onClaudeConnectionChange(false)}
+                    />
+                  </div>
+                ) : (
+                  <KeyField
+                    label="Anthropic API key"
+                    placeholder="sk-ant-…"
+                    value={apiKeys.anthropic ?? ''}
+                    onChange={(value) => setKey('anthropic', value)}
                   />
                 )}
               </CredentialGroup>
@@ -361,22 +396,6 @@ export function Settings({
                 onToggle={() => setBehaviorAdvanced((o) => !o)}
               >
                 <CheckRow
-                  label="TypeSafe (experimental)"
-                  hint="Find relevant skills, run familiar read-only functions, and check extracted facts."
-                  checked={typeSafeEnabled}
-                  onChange={setTypeSafeEnabled}
-                />
-                <label className="field">
-                  <span className="field__label">TypeSafe API key</span>
-                  <input type="password" autoComplete="off" spellCheck={false}
-                    value={typeSafeApiKey} placeholder="Paste your TypeSafe API key"
-                    onChange={(e) => setTypeSafeApiKey(e.target.value)} />
-                </label>
-                <p className="settings-summary">
-                  When enabled, task context, saved guidance and preferences, and source excerpts are sent to TypeSafe.
-                  Uses separate API billing. Changes apply to new turns.
-                </p>
-                <CheckRow
                   label="Let local coding agents open chats here"
                   checked={bridgeEnabled}
                   onChange={setBridgeEnabled}
@@ -438,6 +457,8 @@ export function Settings({
             </>
           ) : section === 'automations' ? (
             <AutomationsPanel onClose={onClose} />
+          ) : section === 'memory' ? (
+            <MemoriesPanel onClose={onClose} />
           ) : section === 'instructions' ? (
             <>
               <p className="settings-summary">
@@ -454,22 +475,11 @@ export function Settings({
                 />
               </label>
 
-              {/* Memory is a plain file, so "manage it" is just "open it" — no
-                  editor here, and nothing to Save (these bypass the draft). */}
               <Row
                 label="Memory"
-                hint="MEMORY.md is always in context; SITES.md only on matching pages."
+                hint="Inspect remembered context, its sources, and when it applies."
               >
-                <button type="button" className="btn btn--ghost" onClick={() => openMemoryFile()}>
-                  MEMORY.md
-                </button>
-                <button
-                  type="button"
-                  className="btn btn--ghost"
-                  onClick={() => openMemoryFile(SITE_MEMORY_PATH)}
-                >
-                  SITES.md
-                </button>
+                <button type="button" className="btn btn--ghost" onClick={() => setSection('memory')}>Manage memories</button>
               </Row>
 
               {/* OpenAI-only: this pass uses the user's own Chrome data and
@@ -651,16 +661,17 @@ function resolveModelId(modelId: string, provider: ProviderKind): string {
   const curated = MODEL_OPTIONS.find((m) => m.id === modelId)
   if (
     curated &&
-    (provider === 'openai' || provider === 'xai' || provider === 'cerebras') &&
+    (provider === 'openai' || provider === 'xai' || provider === 'cerebras' || provider === 'anthropic') &&
     curated.provider !== provider
   ) {
     if (provider === 'xai') return XAI_DEFAULT_MODEL_ID
     if (provider === 'cerebras') return CEREBRAS_DEFAULT_MODEL_ID
+    if (provider === 'anthropic') return ANTHROPIC_DEFAULT_MODEL_ID
     return OPENAI_DEFAULT_MODEL_ID
   }
   if (provider === 'gateway') {
     if (modelId.includes('/')) return modelId
-    return modelId.startsWith('grok') ? `xai/${modelId}` : `openai/${modelId}`
+    return modelId.startsWith('grok') ? `xai/${modelId}` : isAnthropicModelId(modelId) ? `anthropic/${modelId}` : `openai/${modelId}`
   }
   if (provider === 'openai' || provider === 'openai-compatible') {
     return modelId.startsWith('openai/') ? modelId.slice('openai/'.length) : modelId
@@ -669,6 +680,7 @@ function resolveModelId(modelId: string, provider: ProviderKind): string {
     return modelId.startsWith('xai/') ? modelId.slice('xai/'.length) : modelId
   }
   if (provider === 'cerebras') return modelId.replace(/^cerebras\//, '')
+  if (provider === 'anthropic') return modelId.replace(/^anthropic\//i, '')
   return modelId
 }
 

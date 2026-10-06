@@ -25,8 +25,10 @@ import { modelPickerProviders } from '../shared/model-picker'
 import { isRuntimeContextMessage } from '../shared/context-blocks'
 import { isCompacting } from '../shared/compaction'
 import { useSyncExternalStore } from 'react'
-import type { AgentId, ChatCheckpoint, ChatRecord, ChatTurnMeta, CuratedModelProvider, OnboardingSetupRecord, ProviderKind, Settings, TaskInfo, TranscriptItem, Usage, UserAttachment, VirtualFileSystemService, VfsEntry, UserMessageSource } from '../shared/types'
-import { DEFAULT_SETTINGS, FALLBACK_STARTER_PROMPTS, isOpenAIModelId, MODEL_OPTIONS, ONBOARDING_SETUP_TIMEOUT_MS, OPENAI_DEFAULT_MODEL_ID, pinnedSettingsForModel } from '../shared/types'
+import type { AgentId, ChatCheckpoint, ChatRecord, ChatTurnMeta, CuratedModelProvider, OnboardingSetupRecord, ProviderKind, Settings, TaskInfo, TranscriptItem, UserAttachment, VirtualFileSystemService, VfsEntry, UserMessageSource } from '../shared/types'
+import { applyContextUsage, type ContextUsageInfo } from '../shared/context-usage'
+import { importAttachment } from './attachment-import'
+import { ANTHROPIC_DEFAULT_MODEL_ID, DEFAULT_SETTINGS, FALLBACK_STARTER_PROMPTS, isAnthropicModelId, isOpenAIModelId, MODEL_OPTIONS, ONBOARDING_SETUP_TIMEOUT_MS, OPENAI_DEFAULT_MODEL_ID, pinnedSettingsForModel } from '../shared/types'
 import { GROK_SWITCH_MODEL_ID, type ModelSwitchScope } from '../agent/model-switch'
 import { applyMemoryWrite, ensureMemoryFile, MEMORY_PATH } from '../agent/memory'
 import { LUNA_MODEL_ID, runOnboardingSetup } from '../agent/onboarding-luna'
@@ -34,6 +36,9 @@ import { padStarterPrompts, refreshStarterPrompts } from '../agent/starter-promp
 import { MAX_FEEDBACK_SAMPLES, NEXT_PROMPT_MODEL_ID, predictNextPrompt } from '../agent/next-prompt'
 import { hasModelAccess } from '../agent/models'
 import { loadSettings, normalizeSettings, saveSettings as persistSettings, subscribeSettings } from '../storage/settings'
+import { PANEL_DRAFT_KEY } from '../shared/panel-view'
+import { getContextTab } from './context-tab'
+import { browserContextMetadata, type BrowserMessageContext } from '../shared/browser-context'
 import {
   defaultOnboardingSetup,
   loadOnboardingSetup,
@@ -67,9 +72,11 @@ import { RevealBuffer, type RevealCounts } from './reveal'
 import { getRuntime, peekRuntime } from '../runtime'
 import { captureTabShot } from './tabshot'
 import { isChatGPTConnected } from '../agent/openai-chatgpt-oauth'
+import { CLAUDE_AUTH_STORAGE_KEY, getClaudeAccountStatus } from '../agent/anthropic-oauth'
 import type { BridgeErrorCode, ChatOrigin } from '../shared/bridge-protocol'
 import { artifactNameFromPath, type ArtifactInvocation, type ArtifactRuntimeMessage } from '../shared/artifacts'
 import type { ExecutionSnapshot } from '../shared/execution-protocol'
+import { canResumeExecution, isConnectionFailureMessage, recordForResume } from '../shared/execution-recovery'
 import {
   claimBrowserHandoffs,
   ensureOffscreenRuntime,
@@ -84,11 +91,7 @@ import {
  * by orders of magnitude once images/attachments are in the history, so the
  * meter shows nothing rather than a wrong number until the provider reports.
  */
-export interface ContextUsageInfo {
-  modelId: string
-  usage: Usage
-  updatedAt: number
-}
+export type { ContextUsageInfo } from '../shared/context-usage'
 
 /**
  * Set while the chat's turn is paused at a step checkpoint, waiting for the
@@ -118,6 +121,9 @@ export interface RunTimerState {
  */
 export interface DeadTurnInfo {
   at: number
+  kind?: 'connection' | 'interrupted' | 'review'
+  /** UI rows after this checkpoint belong to an uncommitted model request. */
+  committedTranscriptLength?: number
 }
 
 /** Set while an agent's request is paused on a provider rate limit (retried indefinitely). */
@@ -129,6 +135,8 @@ export interface ChatRateLimit {
   message?: string
   /** Subagent holding its attempt until the main agent's reply goes through. */
   waitingForMain?: boolean
+  kind?: 'rate-limit' | 'connection'
+  offline?: boolean
 }
 
 /**
@@ -140,7 +148,7 @@ export interface ChatRateLimit {
  * written to (so a truncated block can point the model at the whole thing).
  */
 export interface PendingAttachment extends UserAttachment {
-  previewUrl: string
+  previewUrl?: string
   snapshotText?: string
   snapshotPath?: string
 }
@@ -153,6 +161,7 @@ export interface UiState {
   settings: Settings
   /** OAuth tokens live in their own store; this mirrors only connection state for render-time gating. */
   chatgptConnected: boolean
+  claudeConnected: boolean
   /** Chats with a live turn, in start order. Parallel turns are supported. */
   runningChatIds: string[]
   /** Composer draft per chat id (preserved across chat switches). */
@@ -234,6 +243,20 @@ export interface QueuedChatMessage {
 
 const QUEUED_MESSAGES_KEY = 'durable-queued-chat-messages-v1'
 
+type PanelDraft = Pick<UiState, 'current' | 'drafts' | 'attachments' | 'browserContexts'>
+
+/** Save UI-only state before the sidebar document relinquishes ownership. */
+export async function savePanelDraft(): Promise<void> {
+  await initStore()
+  const draft: PanelDraft = {
+    current: state.current,
+    drafts: state.drafts,
+    attachments: state.attachments,
+    browserContexts: state.browserContexts,
+  }
+  await chrome.storage.session.set({ [PANEL_DRAFT_KEY]: draft })
+}
+
 function persistQueuedMessages(messages: QueuedChatMessage[]): void {
   void chrome.storage.session.set({ [QUEUED_MESSAGES_KEY]: messages }).catch((err) =>
     debugLog.error('storage', 'persist queued messages', err),
@@ -256,6 +279,7 @@ let state: UiState = {
   current: initialChat(DEFAULT_SETTINGS.modelId),
   settings: { ...DEFAULT_SETTINGS },
   chatgptConnected: false,
+  claudeConnected: false,
   runningChatIds: [],
   drafts: {},
   nextPrompt: {},
@@ -588,6 +612,23 @@ async function adoptExecutionSnapshot(snapshot: ExecutionSnapshot): Promise<void
       : [...state.runningChatIds, snapshot.chatId]
     : state.runningChatIds.filter((id) => id !== snapshot.chatId)
   const patch: Partial<UiState> = { runningChatIds }
+  patch.contextUsage = adoptedRecord.contextUsage
+    ? withKey(state.contextUsage, snapshot.chatId, adoptedRecord.contextUsage)
+    : withoutKey(state.contextUsage, snapshot.chatId)
+  const recoverable = canResumeExecution(snapshot) &&
+    (snapshot.status === 'interrupted' || isConnectionFailureMessage(snapshot.error))
+  patch.deadTurns = snapshot.status === 'interrupted' && !recoverable
+    ? withKey(state.deadTurns, snapshot.chatId, { at: snapshot.updatedAt, kind: 'review' })
+    : recoverable
+      ? withKey(state.deadTurns, snapshot.chatId, {
+          at: snapshot.updatedAt,
+          kind: snapshot.status === 'interrupted' ? 'interrupted' : 'connection',
+          committedTranscriptLength: snapshot.committedTranscriptLength,
+        })
+      : withoutKey(state.deadTurns, snapshot.chatId)
+  patch.rateLimits = active && snapshot.waits && Object.keys(snapshot.waits).length > 0
+    ? withKey(state.rateLimits, snapshot.chatId, snapshot.waits)
+    : withoutKey(state.rateLimits, snapshot.chatId)
   // The host is authoritative for a reattached turn. Local autosave timestamps
   // can be newer than its last event, especially while a tool is waiting.
   if (state.current.id === snapshot.chatId) {
@@ -741,7 +782,7 @@ function compactTabLine(tab: chrome.tabs.Tab, groupTitles: Map<number, string>):
  * Appended to the NEW user message (prompt tail), so it never invalidates the
  * cached prompt prefix the way a per-turn system block would.
  */
-async function buildAmbientContext(firstTurn: boolean): Promise<string> {
+async function buildAmbientContext(firstTurn: boolean): Promise<BrowserMessageContext> {
   try {
     const now = new Date()
     const lines: string[] = [
@@ -764,7 +805,7 @@ async function buildAmbientContext(firstTurn: boolean): Promise<string> {
         debugLog.error('ui', 'ambient context tab groups', err)
       }
     }
-    const [active] = await chrome.tabs.query({ active: true, currentWindow: true })
+    const active = await getContextTab()
     if (active) {
       const title = (active.title ?? '(untitled)').replace(/\s+/g, ' ').trim().slice(0, 60)
       lines.push(`Active tab: [${active.id}] ${title} — ${(active.url ?? '').slice(0, 100)}`)
@@ -777,10 +818,10 @@ async function buildAmbientContext(firstTurn: boolean): Promise<string> {
         lines.push(`- …and ${tabs.length - MAX_CONTEXT_TABS} more — api.tabs.list() for all`)
       }
     }
-    return `<context>\n${lines.join('\n')}\n</context>`
+    return { text: `<context>\n${lines.join('\n')}\n</context>`, tabId: active?.id ?? null }
   } catch (err) {
     debugLog.error('ui', 'ambient context', err)
-    return ''
+    return { text: '', tabId: null }
   }
 }
 
@@ -861,7 +902,10 @@ async function buildUserModelMessage(
   const context = await buildAmbientContext(firstTurn)
   const appshotBlocks = attachments.filter((att) => att.kind === 'appshot').map(appshotContextBlock)
   const browserContextBlocks = browserContexts.map(browserContextBlock)
-  const modelText = [text, ...browserContextBlocks, ...appshotBlocks, context].filter(Boolean).join('\n\n')
+  const fileBlocks = attachments
+    .filter((att) => att.kind === 'file')
+    .map((att) => `<attached_file name=${JSON.stringify(att.name)} path=${JSON.stringify(att.path)} />`)
+  const modelText = [text, ...fileBlocks, ...browserContextBlocks, ...appshotBlocks, context.text].filter(Boolean).join('\n\n')
 
   // Auto-attach workspace images the text refers to, skipping ones already
   // attached explicitly.
@@ -880,8 +924,9 @@ async function buildUserModelMessage(
 
   const content: UserContentPart[] = [{ type: 'text', text: modelText }]
   for (const att of attachments) {
+    if (att.kind === 'file') continue
     try {
-      const base64 = base64FromDataUrl(att.previewUrl) ?? base64FromDataUrl(await vfs.dataUrl(att.path))
+      const base64 = (att.previewUrl ? base64FromDataUrl(att.previewUrl) : undefined) ?? base64FromDataUrl(await vfs.dataUrl(att.path))
       if (!base64) throw new Error(`no data for ${att.path}`)
       content.push({ type: 'file', data: base64, mediaType: att.mediaType, filename: att.name })
     } catch (err) {
@@ -902,7 +947,7 @@ async function buildUserModelMessage(
     }
   }
 
-  return content.length > 1 ? { role: 'user', content } : { role: 'user', content: modelText }
+  return { role: 'user', content: content.length > 1 ? content : modelText, ...browserContextMetadata(context.tabId) }
 }
 
 const NO_LIVE_AGENTS: ReadonlySet<string> = new Set()
@@ -1062,6 +1107,7 @@ function resolveRevert(chatInput: ChatRecord, itemId: string): RevertResult | un
   const draft = checkpoint.userText
   const next: ChatRecord = {
     ...chat,
+    contextUsage: undefined,
     title: transcript.some((it) => it.kind === 'user') ? deriveTitle({ ...chat, transcript }) : 'New chat',
     updatedAt: Date.now(),
     messages,
@@ -1142,8 +1188,8 @@ export function shouldBootstrapExistingUserMemory(showOnboarding: boolean, store
 }
 
 /** Whether the browser-derived setup pass can actually run with this profile. */
-export function hasOnboardingSetupCredential(settings: Settings, chatgptConnected: boolean): boolean {
-  return hasModelAccess(settings, LUNA_MODEL_ID, chatgptConnected)
+export function hasOnboardingSetupCredential(settings: Settings, chatgptConnected: boolean, claudeConnected = false): boolean {
+  return hasModelAccess(settings, LUNA_MODEL_ID, chatgptConnected, claudeConnected)
 }
 
 /**
@@ -1159,6 +1205,7 @@ async function bootstrapExistingUserMemory(args: {
   setup: OnboardingSetupRecord
   showOnboarding: boolean
   chatgptConnected: boolean
+  claudeConnected: boolean
 }): Promise<void> {
   const storedVersion = await loadMemoryBootstrapVersion()
   if (!shouldBootstrapExistingUserMemory(args.showOnboarding, storedVersion)) return
@@ -1170,7 +1217,7 @@ async function bootstrapExistingUserMemory(args: {
   if (
     args.setup.status === 'idle' &&
     state.setup.status === 'idle' &&
-    hasOnboardingSetupCredential(args.settings, args.chatgptConnected)
+    hasOnboardingSetupCredential(args.settings, args.chatgptConnected, args.claudeConnected)
   ) {
     void runLunaPass({ blockComposer: false })
   }
@@ -1183,6 +1230,21 @@ export function initStore(): Promise<void> {
   // Subscribe before loading so a startup read cannot replace a newer change.
   let observedSettings: Settings | undefined
   subscribeSettings((settings) => { observedSettings = settings; setState({ settings }) })
+  let observedClaudeConnected: boolean | undefined
+  let claudeStatusRevision = 0
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !(CLAUDE_AUTH_STORAGE_KEY in changes)) return
+    const revision = ++claudeStatusRevision
+    void getClaudeAccountStatus().then((status) => {
+      if (revision !== claudeStatusRevision) return
+      observedClaudeConnected = status.connected
+      setState({ claudeConnected: status.connected })
+    }).catch(() => {
+      if (revision !== claudeStatusRevision) return
+      observedClaudeConnected = false
+      setState({ claudeConnected: false })
+    })
+  })
   // Dev build only: arm the stream tap BEFORE anything can reach the network,
   // then surface the inspector. Arming is synchronous on purpose — tapFetch
   // decides whether to wrap at resolveModel time, so the onboarding pass (which
@@ -1201,18 +1263,25 @@ export function initStore(): Promise<void> {
       // Connect while loading the saved UI, instead of starting another serial
       // round of worker/storage startup after the chat archive has loaded.
       const runtime = getRuntime()
-      const [loadedSettings, chats, chatgptConnected, setup, queuedStorage] = await Promise.all([
+      const [loadedSettings, chats, chatgptConnected, claudeStatus, setup, queuedStorage] = await Promise.all([
         loadSettings(),
         listChats(),
         isChatGPTConnected().catch(() => false),
+        getClaudeAccountStatus().catch(() => ({ connected: false })),
         loadOnboardingSetup(),
-        chrome.storage.session.get(QUEUED_MESSAGES_KEY),
+        chrome.storage.session.get([QUEUED_MESSAGES_KEY, PANEL_DRAFT_KEY]),
       ])
       const settings = observedSettings ?? loadedSettings
+      const claudeConnected = observedClaudeConnected ?? claudeStatus.connected
+      const panelDraft = queuedStorage[PANEL_DRAFT_KEY] as PanelDraft | undefined
       let current: ChatRecord
       let openedRecord: ChatRecord | undefined
       const first = chats[0]
-      if (first) {
+      if (panelDraft?.current) {
+        const rec = await getChat(panelDraft.current.id) ?? panelDraft.current
+        openedRecord = rec
+        current = normalizeChat(rec)
+      } else if (first) {
         const rec = await getChat(first.id)
         openedRecord = rec
         current = rec ? normalizeChat(rec) : initialChat(settings.modelId)
@@ -1225,7 +1294,8 @@ export function initStore(): Promise<void> {
         Boolean(settings.apiKey?.trim()) ||
         Object.values(settings.apiKeys ?? {}).some((k) => k?.trim())
       const hasChatGPT = settings.openaiAuthMode === 'chatgpt' && chatgptConnected
-      let showOnboarding = !settings.onboardingComplete && !hasAnyKey && !hasChatGPT
+      const hasClaude = (settings.anthropicAuthMode ?? 'claude') === 'claude' && claudeConnected
+      let showOnboarding = !settings.onboardingComplete && !hasAnyKey && !hasChatGPT && !hasClaude
       // The dev fresh-start reset deliberately KEEPS credentials (redoing OAuth
       // on every reload is too slow to retest onboarding with), so the two
       // credential clauses would suppress the very overlay the reset exists to
@@ -1235,7 +1305,11 @@ export function initStore(): Promise<void> {
       const queuedMessages = Array.isArray(queuedStorage[QUEUED_MESSAGES_KEY])
         ? queuedStorage[QUEUED_MESSAGES_KEY] as QueuedChatMessage[]
         : []
-      setState({ settings: observedSettings ?? settings, chats, current, showOnboarding, chatgptConnected, setup, queuedMessages, startupPhase: 'connecting' })
+      setState({ settings: observedSettings ?? settings, chats, current, showOnboarding, chatgptConnected, claudeConnected, setup, queuedMessages, startupPhase: 'connecting' })
+      if (panelDraft) {
+        setState({ drafts: panelDraft.drafts, attachments: panelDraft.attachments, browserContexts: panelDraft.browserContexts })
+        await chrome.storage.session.remove(PANEL_DRAFT_KEY)
+      }
       ensureTaskUpdatesWired()
       ensureExecutionUpdatesWired()
       await runtime.executions.ready()
@@ -1247,7 +1321,7 @@ export function initStore(): Promise<void> {
       // interrupted streaming rows for display, while suggestion recovery must
       // still be able to recognize that they never completed.
       if (openedRecord) startNextPromptPredictionOnOpen(openedRecord)
-      void bootstrapExistingUserMemory({ settings, setup, showOnboarding, chatgptConnected }).catch((err) =>
+      void bootstrapExistingUserMemory({ settings, setup, showOnboarding, chatgptConnected, claudeConnected }).catch((err) =>
         debugLog.error('storage', 'bootstrap existing-user memory', err),
       )
       void drainBrowserHandoffs()
@@ -1263,10 +1337,13 @@ export function initStore(): Promise<void> {
 /** Refresh imported durable data without replacing the current chat or its draft. */
 export async function refreshImportedData(): Promise<void> {
   await initStore()
-  const [settings, chats, chatgptConnected] = await Promise.all([loadSettings(), listChats(), isChatGPTConnected().catch(() => false)])
+  const [settings, chats, chatgptConnected, claudeStatus] = await Promise.all([
+    loadSettings(), listChats(), isChatGPTConnected().catch(() => false),
+    getClaudeAccountStatus().catch(() => ({ connected: false })),
+  ])
   const current = state.current.messages.length === 0 && state.current.transcript.length === 0 && state.current.modelId === state.settings.modelId
     ? { ...state.current, modelId: settings.modelId } : state.current
-  setState({ settings, chats, chatgptConnected, current })
+  setState({ settings, chats, chatgptConnected, claudeConnected: claudeStatus.connected, current })
 }
 
 /* ---- actions ------------------------------------------------------------ */
@@ -1354,7 +1431,9 @@ export async function selectChat(id: string): Promise<void> {
   const rec = await getChat(id)
   if (rec) {
     const current = normalizeChat(rec)
-    setState({ current })
+    setState({ current, contextUsage: current.contextUsage
+      ? withKey(state.contextUsage, id, current.contextUsage)
+      : withoutKey(state.contextUsage, id) })
     debugLog.log('ui', `selected chat ${id}`)
     startNextPromptPredictionOnOpen(rec)
   }
@@ -1409,6 +1488,7 @@ export async function saveSettings(next: Settings): Promise<void> {
 
 /** Curated default model to activate when a provider's key is first connected. */
 function defaultModelForProvider(provider: ProviderKind): string {
+  if (provider === 'anthropic') return ANTHROPIC_DEFAULT_MODEL_ID
   if (provider === 'cerebras') return MODEL_OPTIONS.find((model) => model.provider === 'cerebras')!.id
   if (provider === 'xai') return 'grok-4.6'
   return OPENAI_DEFAULT_MODEL_ID
@@ -1426,7 +1506,8 @@ export async function connectProviderKey(provider: ProviderKind, key: string): P
   const settings = state.settings
   const apiKeys = { ...(settings.apiKeys ?? {}), [provider]: trimmed }
   const activeHasKey = Boolean(apiKeys[settings.provider]?.trim()) && settings.provider !== provider
-  const authMode = provider === 'openai' ? { openaiAuthMode: 'api-key' as const } : {}
+  const authMode = provider === 'openai' ? { openaiAuthMode: 'api-key' as const }
+    : provider === 'anthropic' ? { anthropicAuthMode: 'api-key' as const } : {}
   const next: Settings = activeHasKey
     ? { ...settings, ...authMode, apiKeys }
     : {
@@ -1465,6 +1546,25 @@ export async function connectChatGPTAccount(): Promise<void> {
 /** Mirror OAuth storage changes into render-time credential gating. */
 export function setChatGPTConnectionStatus(connected: boolean): void {
   setState({ chatgptConnected: connected })
+}
+
+/** Activate a subscription after the first-run Claude sign-in. */
+export async function connectClaudeAccount(): Promise<void> {
+  const next: Settings = {
+    ...state.settings,
+    provider: 'anthropic',
+    anthropicAuthMode: 'claude',
+    apiKey: '',
+    modelId: ANTHROPIC_DEFAULT_MODEL_ID,
+  }
+  setState({ claudeConnected: true })
+  await saveSettings(next)
+  if (!activeTurns.has(state.current.id)) setState({ current: { ...state.current, modelId: next.modelId } })
+  debugLog.log('ui', 'Claude account activated')
+}
+
+export function setClaudeConnectionStatus(connected: boolean): void {
+  setState({ claudeConnected: connected })
 }
 
 /** What we keep of the answer to "what should we call you?" — a greeting, not a legal name. */
@@ -1701,7 +1801,7 @@ export async function setModelId(modelId: string): Promise<void> {
   const chatId = state.current.id
   setState({
     contextUsage: withoutKey(state.contextUsage, chatId),
-    current: { ...state.current, modelId },
+    current: { ...state.current, modelId, contextUsage: undefined },
   })
   await saveSettings(next)
 
@@ -1778,12 +1878,18 @@ export function hasXaiKey(): boolean {
  * not something the picker can know.
  */
 export function availableModelProviders(): CuratedModelProvider[] {
-  return modelPickerProviders(state.settings, state.chatgptConnected)
+  return modelPickerProviders(state.settings, state.chatgptConnected, state.claudeConnected)
 }
 
 /** True when the active provider has the credential type it is configured to use. */
 export function hasActiveCredential(): boolean {
-  return hasModelAccess(state.settings, state.current.modelId, state.chatgptConnected)
+  return hasModelAccess(state.settings, state.current.modelId, state.chatgptConnected, state.claudeConnected)
+}
+
+export function isClaudeModel(modelId = state.current.modelId): boolean {
+  if (isAnthropicModelId(modelId)) return true
+  const option = MODEL_OPTIONS.find((model) => model.id === modelId.trim())
+  return option ? option.provider === 'anthropic' : state.settings.provider === 'anthropic' && !isOpenAIModelId(modelId)
 }
 
 /** True when the given model id (or the current chat's model) is an OpenAI model. */
@@ -1919,7 +2025,7 @@ export function shouldOfferNextPrompt(input: {
  * request that cannot be served.
  */
 function nextPromptCredentialReady(settings: Settings): boolean {
-  return hasModelAccess(settings, NEXT_PROMPT_MODEL_ID, state.chatgptConnected)
+  return hasModelAccess(settings, NEXT_PROMPT_MODEL_ID, state.chatgptConnected, state.claudeConnected)
 }
 
 /**
@@ -2065,21 +2171,16 @@ export function removeAttachment(id: string): void {
 }
 
 /**
- * Stage dropped/pasted images: each is saved into /workspace/attachments (so
- * the agent can read it by path later and it shows in the file panel) and added
- * as a composer chip. Non-images and oversized files are skipped with a notice.
+ * Stage dropped files and pasted images in /workspace/attachments. Non-image
+ * files are passed to the agent by VFS path instead of embedding their bytes.
  */
-export async function attachImageFiles(files: File[]): Promise<void> {
+export async function attachFiles(files: File[]): Promise<void> {
   const chatId = state.current.id
   setAttachmentNotice(chatId, undefined)
   const skipped: string[] = []
   let accepted = 0
 
   for (const file of files) {
-    if (!file.type.startsWith('image/')) {
-      skipped.push(`${file.name || 'file'} (not an image)`)
-      continue
-    }
     if (file.size > MAX_ATTACHMENT_BYTES) {
       skipped.push(`${file.name} (over ${Math.round(MAX_ATTACHMENT_BYTES / 1_000_000)} MB)`)
       continue
@@ -2090,18 +2191,19 @@ export async function attachImageFiles(files: File[]): Promise<void> {
     }
     try {
       const vfs = getRuntime().vfs
-      const entry = await vfs.putFile('workspace', file, `attachments/${file.name || `image-${Date.now()}.png`}`)
+      const entry = await importAttachment(vfs, file)
+      const isImage = entry.mediaType.startsWith('image/')
       stagePendingAttachment(chatId, {
         id: uid('att'),
-        kind: 'image',
+        kind: isImage ? 'image' : 'file',
         path: entry.path,
         name: entry.name,
         mediaType: entry.mediaType,
-        previewUrl: await vfs.dataUrl(entry.path),
+        previewUrl: isImage ? await vfs.dataUrl(entry.path) : undefined,
       })
       accepted += 1
     } catch (err) {
-      debugLog.error('ui', 'attach dropped image', err)
+      debugLog.error('ui', 'attach dropped file', err)
       skipped.push(`${file.name} (${formatError(err)})`)
     }
   }
@@ -2109,7 +2211,7 @@ export async function attachImageFiles(files: File[]): Promise<void> {
   if (skipped.length > 0) {
     setAttachmentNotice(chatId, `Skipped ${skipped.join(', ')}`)
   }
-  if (accepted > 0) debugLog.log('ui', `attached ${accepted} image(s)`)
+  if (accepted > 0) debugLog.log('ui', `attached ${accepted} file(s)`)
 }
 
 /**
@@ -2128,7 +2230,7 @@ export async function captureAppshot(): Promise<void> {
     if ((state.attachments[chatId]?.length ?? 0) >= MAX_PENDING_ATTACHMENTS) {
       throw new Error(`attachment limit is ${MAX_PENDING_ATTACHMENTS} per message`)
     }
-    const [active] = await chrome.tabs.query({ active: true, currentWindow: true })
+    const active = await getContextTab()
     if (!active || typeof active.id !== 'number') throw new Error('no active tab to capture')
     if (/^(chrome|edge|devtools|about|chrome-extension):/i.test(active.url ?? '')) {
       throw new Error('browser-internal pages cannot be captured')
@@ -2181,6 +2283,8 @@ export async function captureAppshot(): Promise<void> {
  * at the next step boundary (after the next tool call finishes) while the
  * model keeps working. If this chat has no running turn it sends normally.
  */
+let steeringContextQueue: Promise<void> = Promise.resolve()
+
 export function addSteering(text: string): void {
   if (chatIsRunning(state.current.id) && isCompacting(state.current.transcript)) return
   const trimmed = text.trim()
@@ -2195,18 +2299,23 @@ export function addSteering(text: string): void {
     steering: withKey(state.steering, chatId, prev ? `${prev}\n\n${trimmed}` : trimmed),
     drafts: withoutKey(state.drafts, chatId),
   })
-  getRuntime().executions.steer(chatId, trimmed)
-  // A turn paused at a step checkpoint has no upcoming step boundary to attach
-  // steering at — talking to the agent counts as "keep going".
-  resolveStepPrompt(chatId, true)
-  // Escape hatch for a blocking prompt card: answering in the composer instead
-  // of on the card is a legitimate answer. The prompt resolves as 'steered'
-  // (its tool result only says so — the text itself arrives once, through the
-  // normal steering path above, so the model never sees it twice).
-  if (resolveUserPrompt(chatId, { status: 'steered', text: trimmed })) {
-    debugLog.log('ui', 'user prompt steered past via the composer')
-  }
-  debugLog.log('ui', 'steering queued for running turn')
+  const context = buildAmbientContext(false)
+  // Preserve message order and post the captured context before releasing a
+  // parked question/step. The steering event still contains only user text.
+  steeringContextQueue = steeringContextQueue.catch(() => {}).then(async () => {
+    getRuntime().executions.steer(chatId, trimmed, await context)
+    // A turn paused at a step checkpoint has no upcoming step boundary to attach
+    // steering at — talking to the agent counts as "keep going".
+    resolveStepPrompt(chatId, true)
+    // Escape hatch for a blocking prompt card: answering in the composer instead
+    // of on the card is a legitimate answer. The prompt resolves as 'steered'
+    // (its tool result only says so — the text itself arrives once, through the
+    // normal steering path above, so the model never sees it twice).
+    if (resolveUserPrompt(chatId, { status: 'steered', text: trimmed })) {
+      debugLog.log('ui', 'user prompt steered past via the composer')
+    }
+    debugLog.log('ui', 'steering queued for running turn')
+  })
 }
 
 export function clearSteering(): void {
@@ -2301,8 +2410,12 @@ export function nudgeTask(taskId: string, text: string): void {
  */
 export async function retryDeadTurn(): Promise<void> {
   const chatId = state.current.id
-  if (!state.deadTurns[chatId] || activeTurns.has(chatId)) return
-  await runTurn(normalizeChat(state.current), '', true, [], [], { retry: true })
+  const dead = state.deadTurns[chatId]
+  if (!dead || dead.kind === 'review' || activeTurns.has(chatId)) return
+  const base = normalizeChat(state.current)
+  const retryRecord = recordForResume(base, dead.committedTranscriptLength)
+  setState({ current: retryRecord })
+  await runTurn(retryRecord, '', true, [], [], { retry: true })
 }
 
 async function persistCurrentChat(chat: ChatRecord): Promise<void> {
@@ -2356,7 +2469,8 @@ async function restageAttachments(chatId: string, attachments: UserAttachment[])
   let staged = 0
   for (const att of attachments) {
     try {
-      const previewUrl = await vfs.dataUrl(att.path)
+      if (!(await vfs.getEntry(att.path))) continue
+      const previewUrl = att.kind === 'file' ? undefined : await vfs.dataUrl(att.path)
       let snapshotText: string | undefined
       let snapshotPath: string | undefined
       if (att.kind === 'appshot') {
@@ -2548,6 +2662,7 @@ async function runTurn(
   const createdAt = base.createdAt
   let turnHadError = false
   let turnProducedContent = false
+  let recoverableFailure: DeadTurnInfo | undefined
   /** Main agent's finished text, captured for the completion notification's snippet. */
   let finalAgentText = ''
 
@@ -2556,6 +2671,7 @@ async function runTurn(
   // the chat's sticky model and turn meta match what the agent actually ran.
   const turnStartedAt = Date.now()
   let turnModelId = settings.modelId
+  let contextUsage = state.contextUsage[chatId] ?? base.contextUsage
   let turnProvider: ProviderKind = settings.provider
   let steeringCount = 0
   let rateLimitWaits = 0
@@ -2577,6 +2693,7 @@ async function runTurn(
     updatedAt: Date.now(),
     modelId: turnModelId,
     messages,
+    contextUsage,
     transcript,
     checkpoints,
     turns,
@@ -2674,13 +2791,15 @@ async function runTurn(
       acknowledgeSteering(chatId, e.text)
     }
     if (e.type === 'rate-limit') {
-      if (e.agentId === 'main') rateLimitWaits += 1
+      if (e.agentId === 'main' && e.kind !== 'connection') rateLimitWaits += 1
       setAgentRateLimit(e.agentId, {
         agentId: e.agentId,
         attempt: e.attempt,
         retryAt: Date.now() + e.retryInMs,
         message: e.message,
         waitingForMain: e.waitingForMain,
+        kind: e.kind,
+        offline: e.offline,
       })
       return
     }
@@ -2695,13 +2814,9 @@ async function runTurn(
         turnModelId = e.modelId
         const option = MODEL_OPTIONS.find((m) => m.id === e.modelId)
         if (option) turnProvider = option.provider
-        const prev = state.contextUsage[chatId]
+        contextUsage = applyContextUsage(contextUsage, e)
         setState({
-          contextUsage: withKey(state.contextUsage, chatId, {
-            modelId: e.modelId,
-            usage: prev?.usage ?? {},
-            updatedAt: Date.now(),
-          }),
+          contextUsage: withoutKey(state.contextUsage, chatId),
         })
         publish()
         autosave()
@@ -2714,12 +2829,9 @@ async function runTurn(
     if (e.type === 'agent-error') turnHadError = true
     if (e.type === 'agent-finish' && e.agentId === 'main') finalAgentText = e.text
     if (e.type === 'usage-update' && e.agentId === 'main') {
+      contextUsage = applyContextUsage(contextUsage, e)
       setState({
-        contextUsage: withKey(state.contextUsage, chatId, {
-          modelId: e.modelId,
-          usage: e.usage,
-          updatedAt: Date.now(),
-        }),
+        contextUsage: contextUsage ? withKey(state.contextUsage, chatId, contextUsage) : withoutKey(state.contextUsage, chatId),
       })
     }
     transcript = applyEvent(transcript, e)
@@ -2789,6 +2901,21 @@ async function runTurn(
       aborted: controller.signal.aborted || undefined,
     })
   } catch (err) {
+    if (!controller.signal.aborted && versionCurrent()) {
+      const failed = runtime.executions.list().find((execution) =>
+        execution.chatId === chatId && execution.startedAt >= turnStartedAt &&
+        (execution.status === 'error' || execution.status === 'interrupted'))
+      if (failed?.status === 'interrupted' && !canResumeExecution(failed)) {
+        recoverableFailure = { at: Date.now(), kind: 'review' }
+      } else if (failed && canResumeExecution(failed) &&
+          (failed.status === 'interrupted' || isConnectionFailureMessage(formatError(err)))) {
+        // The host's last completed step is the replay boundary. Keep partial
+        // UI visible until Resume, but use its committed model history then.
+        messages = sanitizeModelMessages(failed.record.messages)
+        recoverableFailure = { at: Date.now(), kind: failed.status === 'interrupted' ? 'interrupted' : 'connection',
+          committedTranscriptLength: failed.committedTranscriptLength }
+      }
+    }
     turnMeta = makeTurnMeta({
       errorText: controller.signal.aborted ? undefined : formatError(err),
       aborted: controller.signal.aborted || undefined,
@@ -2821,7 +2948,7 @@ async function runTurn(
     // Dead turn: not a user abort, and nothing visible (no text/reasoning/tool
     // activity) reached the transcript this turn — a harness-level failure the
     // user has no recourse for besides retyping. Drives the retry chip below.
-    const isDeadTurn = !turnAborted && !turnProducedContent
+    const isDeadTurn = !turnAborted && (!turnProducedContent || !!recoverableFailure)
     if (turnMeta) turns = [...turns, { ...turnMeta, deadTurn: isDeadTurn || undefined }]
     // Catch any items a late in-flight event re-opened between the Stop
     // settle and the stream fully closing, so the persisted record is quiet.
@@ -2848,7 +2975,9 @@ async function runTurn(
         runningChatIds: state.runningChatIds.filter((id) => id !== chatId),
         rateLimits: withoutKey(state.rateLimits, chatId),
         runTimer: withoutKey(state.runTimer, chatId),
-        deadTurns: isDeadTurn ? withKey(state.deadTurns, chatId, { at: Date.now() }) : withoutKey(state.deadTurns, chatId),
+        deadTurns: isDeadTurn ? withKey(state.deadTurns, chatId,
+          recoverableFailure ?? { at: Date.now(), kind: isConnectionFailureMessage(turnMeta?.errorText) ? 'connection' : undefined })
+          : withoutKey(state.deadTurns, chatId),
         ...extra,
       })
     }

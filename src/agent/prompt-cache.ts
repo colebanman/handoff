@@ -1,7 +1,7 @@
 /**
  * Prompt-cache plumbing for the agent loop.
  *
- * Anthropic models (reached through the gateway) only cache prompt prefixes at
+ * Anthropic models (direct or through the gateway) cache prompt prefixes at
  * explicit `cache_control` breakpoints — max 4 per request, and a breakpoint
  * covers everything before it (tools, then system blocks, then messages). We
  * spend the budget as:
@@ -45,9 +45,9 @@ import type { SystemPromptParts } from './system-prompt'
 
 const EPHEMERAL_CACHE = { anthropic: { cacheControl: { type: 'ephemeral' } } }
 
-/** Explicit cache_control applies to Anthropic models reached through the gateway. */
+/** Both native Messages and the gateway support Anthropic cache_control. */
 export function supportsAnthropicPromptCache(provider: Settings['provider'], modelId: string): boolean {
-  return provider === 'gateway' && modelId.trim().toLowerCase().startsWith('anthropic/')
+  return provider === 'anthropic' || (provider === 'gateway' && modelId.trim().toLowerCase().startsWith('anthropic/'))
 }
 
 export interface CacheRequestOptions {
@@ -69,15 +69,25 @@ export function cacheRequestOptions(
   openaiAuthMode?: Settings['openaiAuthMode'],
 ): CacheRequestOptions {
   const id = modelId.trim().toLowerCase()
+  if (supportsAnthropicPromptCache(provider, modelId) && /^(?:anthropic\/)?claude-(?:opus|sonnet)-5-5(?:-|$)/.test(id)) {
+    return {
+      providerOptions: { anthropic: { thinking: {
+        type: 'adaptive', display: 'summarized',
+        // Normal replay is append-only. Rewind, edited standing instructions,
+        // and cross-provider history can still invalidate a signed prefix.
+        blockBinding: { prefixMismatchBehavior: 'drop_block' },
+      } } },
+    }
+  }
   const isOpenAI = provider === 'openai' || (provider === 'gateway' && id.startsWith('openai/'))
   if (isOpenAI) {
     return {
       providerOptions: {
         openai: {
-          // This adapter's built-in model table predates Astra. Without the
-          // override it drops reasoningSummary and reasoning replay settings
-          // as "unsupported for non-reasoning models".
-          ...(/^(?:openai\/)?gpt-6-astra(?:-|$)/.test(id) ? { forceReasoning: true, reasoningEffort: 'low' as const } : {}),
+          // This adapter's built-in model table predates GPT-6. Without the
+          // override it drops reasoning summaries and reasoning replay.
+          ...(/^(?:openai\/)?gpt-(?:6-(?:astra|sol|luna)|6\.1-sol)(?:-|$)/.test(id) ? { forceReasoning: true } : {}),
+          ...(/^(?:openai\/)?gpt-6-astra(?:-|$)/.test(id) ? { reasoningEffort: 'low' as const } : {}),
           promptCacheKey: cacheKey,
           // The ChatGPT Codex transport uses its own managed cache policy and
           // does not include the Platform API retention extension.

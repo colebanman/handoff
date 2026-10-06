@@ -37,9 +37,10 @@ const ORIGINATOR = 'handoff'
  * gpt-5.5) and the backend filters the response by the `client_version` query
  * param, so a 0.1.0 client is told no models exist at all.
  *
- * Bump this when adopting a Codex protocol feature that needs a newer floor.
+ * Keep the catalog version current when adopting newer Codex models; the
+ * backend hides models whose minimum client version exceeds this value.
  */
-const CODEX_CLIENT_VERSION = '0.144.0'
+const CODEX_CLIENT_VERSION = '0.155.1'
 
 export interface StoredTokens {
   accessToken: string
@@ -666,7 +667,7 @@ export async function listChatGPTModels(force = false, signal?: AbortSignal): Pr
       id: model.slug as string,
       label: typeof model.display_name === 'string' ? model.display_name : (model.slug as string),
       provider: 'openai' as const,
-      ...(typeof model.context_window === 'number' && model.context_window > 0 ? { contextWindow: model.context_window } : {}),
+      ...(typeof model.context_window === 'number' && Number.isSafeInteger(model.context_window) && model.context_window > 0 ? { contextWindow: model.context_window } : {}),
     }))
   modelCache = { accountId: credentials.accountId, at: Date.now(), models }
   // The catalog silently came back empty for a long time (see

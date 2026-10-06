@@ -1,6 +1,7 @@
 import type { AgentRuntime, ModelSwitchScope, SessionModelOverride } from '../agent'
 import type { AgentEvent, RunTurnOptions, TaskInfo, TurnResult } from '../shared/types'
 import type { UserPromptAnswer } from '../shared/user-prompt'
+import type { BrowserMessageContext } from '../shared/browser-context'
 import { uid } from '../shared/ids'
 import { abortable, throwIfAborted } from '../shared/abort'
 import {
@@ -23,7 +24,7 @@ export interface ExecutionClient {
   ready(): Promise<void>
   list(): ExecutionSnapshot[]
   onChange(listener: (snapshot: ExecutionSnapshot) => void): () => void
-  steer(chatId: string, text: string): void
+  steer(chatId: string, text: string, browserContext?: BrowserMessageContext): void
   cancelChat(chatId: string): void
   answerInteraction(runId: string, requestId: string, value: boolean | UserPromptAnswer | string): void
   acknowledge(runId: string): Promise<void>
@@ -221,7 +222,7 @@ export function createAgentClient(): { agent: AgentRuntime; executions: Executio
       snapshotListeners.add(listener)
       return () => snapshotListeners.delete(listener)
     },
-    steer: (chatId, text) => post({ type: 'steer', chatId, text }),
+    steer: (chatId, text, browserContext) => post({ type: 'steer', chatId, text, ...(browserContext ? { browserContext } : {}) }),
     cancelChat: (chatId) => post({ type: 'cancel', chatId }),
     answerInteraction: (runId, requestId, value) => post({ type: 'interaction-result', runId, requestId, value }),
     acknowledge: async (runId) => {

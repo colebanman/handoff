@@ -27,16 +27,18 @@ import {
   describeCombinedMemoryWrite,
 } from './site-memory'
 import type { AgentTabGroups } from './tab-groups'
-import { sharedSurfaceAssignments, tabSurface, type AgentSurface } from './surfaces'
+import { guardCdpOwnership, sharedSurfaceAssignments, tabSurface, type AgentSurface } from './surfaces'
+import { formFieldsSchema } from '../shared/form-fill'
 import { formatUserPromptAnswer, type AskUserFn, type UserPromptRequest } from '../shared/user-prompt'
 import { abortableDelay, throwIfAborted } from '../shared/abort'
 import { isHtmlArtifactEntry, type ArtifactHostService } from '../shared/artifacts'
-import { verifyExtraction, type TypeSafeSession } from './typesafe'
+import { memoryRuntime } from './continuity-context'
 
 /** Per-agent mutable context: identity + tracked current tab + scope. */
 export interface AgentContext {
   extensionRevisions?: Record<string, number>
   agentId: string
+  surfaceOwnerId?: string
   /** The tab used when a tool call omits `tabId`. */
   currentTabId: number
   /** Defined for subagents (tab-scoped); undefined for the main agent. */
@@ -97,7 +99,6 @@ export interface TaskAccess {
 }
 
 export interface BuildToolsArgs {
-  typeSafe?: TypeSafeSession
   cdp: CdpService
   sandbox: SandboxService
   vfs: VirtualFileSystemService
@@ -131,10 +132,15 @@ export interface BuildToolsArgs {
 /** Keeps turn/task cancellation non-terminal until every started tool settles. */
 export class ToolOperationTracker {
   private readonly active = new Set<Promise<unknown>>()
+  private started = 0
+
+  /** Includes settled tools, so retry decisions cannot replay a fast mutation. */
+  get startedCount(): number { return this.started }
 
   constructor(private readonly onStart?: () => (() => void) | undefined) {}
 
   track<T>(operation: Promise<T>): Promise<T> {
+    this.started += 1
     const endActivity = this.onStart?.()
     this.active.add(operation)
     void operation.finally(() => {
@@ -176,6 +182,7 @@ async function spillTruncate(
   toolName: string,
   text: string,
   maxChars = MAX_TOOL_OUTPUT,
+  onSpill?: (path: string, text: string) => Promise<void>,
 ): Promise<string> {
   if (text.length <= maxChars) return text
   const kept = sliceWellFormed(text, maxChars)
@@ -184,6 +191,9 @@ async function spillTruncate(
     const infix = Math.random().toString(36).slice(2, 6)
     const path = `${SPILL_DIR}/${Date.now()}-${infix}-${toolName}.txt`
     await vfs.writeText(path, text, { mediaType: 'text/plain' })
+    // Preserve overflow evidence before the temporary spill can be garbage-collected.
+    // Memory failure must not turn an already successful tool operation into a failure.
+    try { await onSpill?.(path, text) } catch (error) { debugLog.error('agent', 'memory spill capture', error) }
     return (
       kept +
       `\n\n[Truncated ${text.length - maxChars} chars — full ${text.length}-char output saved to ${path} ` +
@@ -240,12 +250,14 @@ const SANDBOX_API_CHEATSHEET = `API SHAPES (exact — no probing needed):
 - api.fs.importUrl(url, {path?}) -> entry; downloads with session cookies into /workspace/imports/
 - api.tabs.list() -> [{id, url, title, active, windowId, groupId, ...}]; api.tabs.close(id | [ids])
 - api.fetch(url, init?) -> {status, ok, url, headers, text}; for binaries pass {responseType:'base64'} -> {status, ok, url, headers, base64, mediaType, size}. Sends session cookies by default.
+- api.page.fetch(tabId?, url, init?) -> {status, ok, url, headers, text, truncated, totalChars} for text responses; runs inside the page with its cookies/origin.
 - api.page.attachFiles(tabId?, pathOrPaths, {ref?, selector?, mode?}) -> attaches VFS files to an input or drop target; mode is "auto" (default), "input", or "drop"
+- api.page.fill(tabId?, [{ref,text,clear?}|{ref,select}|{ref,checked}]); api.page.select(tabId?, ref, exactOptionLabel) -> {ok,fields:[{ref,status,reason?}],stopped?}. Status is verified/uncertain/unattempted. Performs local readiness/value checks; inspect partial results, never replay the batch. No submit.
 - api.page.eval(tabId, expr) -> the expression's JSON value; api.page.waitForLoad(tabId?, timeoutMs?) -> {ok:true, loaded:boolean}; api.cdp(tabId, method, params) -> raw CDP result
 - api.artifacts.create({path:'week.html', html, open?}) -> entry + url (files live in /workspace/artifacts/, open views live-reload on rewrite); api.artifacts.eval(path, code) -> {value, logs} runs async JS INSIDE the live document (ai/document/window in scope; bare expression auto-returned; DOM nodes -> outerHTML); api.artifacts.save(path) persists the live DOM; api.artifacts.logs(path) -> console/error lines; api.artifacts.trace(path) -> every ai.* call the page made [{at, call, ok, status, ms, error}]; api.artifacts.reset(path) -> clear ai.state + console + trace and re-render like a first open; api.artifacts.open(path, {active?}) -> {tabId, url}; api.artifacts.reload(path); api.artifacts.close(path); api.artifacts.list(). Inside eval: await ai.waitFor(() => document.querySelector('.row'), {timeoutMs}) for async content. Screenshot the rendered page with filesystem_view(path).
 - api.automations.create({ title?, prompt, schedule, timeZone?, chat? }) -> summary with id + nextRun. schedule: { daily: "08:00" } | { weekdays: "9am" } | { weekly: { on: ["mon","thu"], at: "09:00" } } | { monthly: { day: 1, at: "09:00" } } | { every: "2h" } (min 5m) | { once: "2026-09-12T08:00" }. chat: "this" (default: the current chat) | "new" | a chatId. api.automations.update(id, { prompt?, schedule?, timeZone?, chat?, enabled?, title? }); api.automations.list(); api.automations.get(id); api.automations.run(id); api.automations.delete(id).
 - api.stickies.create({ name, title?, content, pages?, position?, open? }) -> summary (a small collaborative Markdown note at /workspace/stickies/<name>.md, floating on the user's pages while open; body delivered to chats as <stickies>); api.stickies.update(name, { content?, title?, pages?, position?, open?, collapsed? }); api.stickies.open(name, { pages?, position? }); api.stickies.close(name); api.stickies.get(name); api.stickies.list(); api.stickies.delete(name). pages: "all" | ["mail.google.com/**", "calendar.google.com"]; position: top-right | top-left | bottom-right | bottom-left.
-Failed api.* calls THROW inside your snippet — try/catch to continue.`
+API execution/transport failures THROW inside your snippet — try/catch to continue. HTTP errors from api.fetch and api.page.fetch return normally with ok:false. Check ok/status before parsing text, and check page.fetch truncation before parsing JSON. Validate the parsed shape before using array methods (Array.isArray(data)); valid JSON may be an error object or a wrapper. On unexpected status/shape, return the URL, status, and a bounded response excerpt so you can diagnose it; never substitute [] and report no results. For independent batch reads, preserve successes and report each failed request separately.`
 
 export function buildTools(args: BuildToolsArgs): ToolSet {
   const {
@@ -273,12 +285,13 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
   // resolution or a preceding await cannot dispatch a later CDP/VFS action.
   // Mutating VFS calls also receive the signal so multi-await operations (URL
   // import, createSkill, memory writes) stop before their next write.
-  const cdp = abortGuardCdp(rawCdp, signal)
+  const ownerId = ctx.surfaceOwnerId ?? ctx.agentId
+  const cdp = guardCdpOwnership(abortGuardCdp(rawCdp, signal), ownerId)
   const vfs = abortGuardVfs(rawVfs, signal)
 
   const visibleToolOutputChars = Math.max(1_000, maxToolOutputChars ?? MAX_TOOL_OUTPUT)
   const spillToolOutput = (toolName: string, text: string): Promise<string> =>
-    spillTruncate(vfs, toolName, text, visibleToolOutputChars)
+    spillTruncate(vfs, toolName, text, visibleToolOutputChars, chatId ? (path, full) => memoryRuntime()?.captureSpill?.(chatId, toolName, path, full) ?? Promise.resolve() : undefined)
 
   const isSubagent = ctx.allowedTabIds !== undefined
   // Surface ownership is an IDENTITY question, not a scope question: the main
@@ -290,12 +303,12 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
 
   /**
    * The main agent's automatic, yielding, expiring claim on a surface it is
-   * actually working on. It cannot fail and never displaces a subagent; it only
-   * stops a later `subagent_spawn` handing that surface away mid-task.
+   * actually working on. A conflicting agent is rejected before dispatch;
+   * delegation can explicitly hand an idle parent claim to its child.
    */
   function noteMainSurface(surface: AgentSurface): void {
     if (!isMainAgent) return
-    surfaceClaims.softClaim(ctx.agentId, [surface])
+    surfaceClaims.beginUse(ownerId, [surface])()
   }
 
   /**
@@ -317,6 +330,8 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
 
   /** The tab scope passed to sandbox exec. `allowedTabIds` undefined => unrestricted main agent. */
   const scope: TabScope = {
+    sessionId: sandboxSessionId,
+    surfaceOwnerId: ownerId,
     get extensionRevisions() { return ctx.extensionRevisions },
     onTabObserved: args.onTabObserved,
     agentId: ctx.agentId,
@@ -337,7 +352,7 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
   }
 
   function currentScopeTabs(): number[] {
-    return ctx.allowedTabIds && ctx.allowedTabIds.length > 0 ? [...ctx.allowedTabIds] : [ctx.currentTabId]
+    return ctx.allowedTabIds !== undefined ? [...ctx.allowedTabIds] : [ctx.currentTabId]
   }
 
   async function addGroupedTabs(tabIds: Array<number | undefined>): Promise<void> {
@@ -352,10 +367,13 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
     }
   }
 
-  async function withGroupedTabs<T>(tabIds: number[] | undefined, fn: () => Promise<T>): Promise<T> {
-    await addGroupedTabs(tabIds ?? [])
-    throwIfAborted(signal)
-    return await fn()
+  async function withGroupedTabs<T>(tabIds: number[] | undefined, fn: () => Promise<T>, claim = true): Promise<T> {
+    const release = claim ? surfaceClaims.beginUse(ownerId, (tabIds ?? []).map(tabSurface)) : () => {}
+    try {
+      await addGroupedTabs(tabIds ?? [])
+      throwIfAborted(signal)
+      return await fn()
+    } finally { release() }
   }
 
   function markCreatedTab(tabId: number): void {
@@ -398,13 +416,13 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
   }
   // NOTE: the "Fresh browser observation:" marker
   // below is parsed by history-pruning.ts — change both files together.
-  async function withFreshSnapshot(id: number, message: string, toolName: string): Promise<string> {
+  async function withFreshSnapshot(id: number, message: string, toolName: string, settle = true): Promise<string> {
     if (signal.aborted) return `${message}\n\n(Automatic snapshot skipped because the turn was stopped.)`
     try {
-      await abortableDelay(SETTLE_DELAY_MS, signal)
-      let loaded = await cdp.waitForLoad(id, SETTLE_LOAD_TIMEOUT_MS)
-      const navigationTrail = await settleAuthRedirects(id)
-      if (navigationTrail?.authLikely) loaded = (await cdp.waitForLoad(id, SETTLE_LOAD_TIMEOUT_MS)) || loaded
+      if (settle) await abortableDelay(SETTLE_DELAY_MS, signal)
+      let loaded = settle ? await cdp.waitForLoad(id, SETTLE_LOAD_TIMEOUT_MS) : true
+      const navigationTrail = settle ? await settleAuthRedirects(id) : await getNavigationTrail(id)
+      if (settle && navigationTrail?.authLikely) loaded = (await cdp.waitForLoad(id, SETTLE_LOAD_TIMEOUT_MS)) || loaded
       const snap = await cdp.snapshot(id, ctx.allowedTabIds)
       const header = `Tab ${snap.tabId}: ${snap.title || '(untitled)'}\nURL: ${snap.url}`
       const navigation = formatNavigationTrail(navigationTrail ?? await getNavigationTrail(id))
@@ -589,37 +607,25 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
 
     browser_fill: tool({
       description:
-        'Fill several independent text fields from ONE current snapshot, in order, using the same keyboard events as browser_type. Clear defaults to true per field. No intermediate snapshots or per-field settle waits; returns one fresh snapshot to verify all values. Use for stable form sections, not fields that reveal/rebuild other fields or trigger navigation. Stops on the first error, reports completed/uncertain/unattempted fields, and never retries or submits. Do not run other actions or snapshots on this tab concurrently.',
+        'PREFER for filling one or several fields with known answers from the current snapshot. Each field has exactly one of text (clear defaults true), select (exact option label), or checked (boolean for checkbox/switch). Use select for comboboxes, including searchable React Select controls; query entry, associated popup selection and committed-value verification happen locally without intermediate model turns. Also supports native dropdowns and custom listboxes. Returns verified/uncertain/unattempted fields and one fresh snapshot. Stops on ambiguity, failed verification or changed form structure. Never submits or replays actions. Inspect partial results before continuing; do not run other actions or snapshots on this tab concurrently.',
       inputSchema: z.object({
-        fields: z.array(z.object({
-          ref: z.string().describe('Input/textarea ref from the latest snapshot.'),
-          text: z.string().describe('Text to enter.'),
-          clear: z.boolean().optional().describe('Replace existing text (default true); false appends at the caret.'),
-        })).min(1).max(50).refine(
-          (fields) => new Set(fields.map((field) => field.ref)).size === fields.length,
-          'Each field ref must appear only once.',
-        ),
+        fields: formFieldsSchema,
         tabId: z.number().int().optional().describe('Tab containing every field; defaults to the current tab.'),
       }),
       execute: async ({ fields, tabId }) => {
         try {
           const id = resolveTab(tabId)
           return await withGroupedTabs([id], async () => {
-            const completed: string[] = []
-            let failure = ''
-            for (const field of fields) {
-              try {
-                throwIfAborted(signal)
-                await cdp.type(id, field.ref, field.text, { clear: field.clear ?? true, signal })
-                completed.push(field.ref)
-              } catch (err) {
-                const remaining = fields.slice(completed.length + 1).map((item) => item.ref)
-                failure = `\nStopped at ${field.ref}: ${formatError(err)}. This field may be partially changed; inspect it before retrying. No actions were replayed. Not attempted: ${remaining.join(', ') || 'none'}.`
-                break
-              }
-            }
-            const message = `Typing completed for ${completed.length}/${fields.length} fields in tab ${id}: ${completed.join(', ') || 'none'}.${failure}\nVerify the resulting values in the snapshot before continuing; typing completion is not a value-validation result.`
-            return await withFreshSnapshot(id, message, 'browser_fill')
+            const result = await cdp.fill(id, fields, signal)
+            const verified = result.fields.filter(field => field.status === 'verified').length
+            debugLog.log('agent', 'browser_fill', {
+              agentId: ctx.agentId, tabId: id, ok: result.ok, verified, total: fields.length,
+              stopped: result.stopped?.slice(0, 240),
+            })
+            const message = `${result.ok ? '' : 'Error: Form fill stopped. '}Verified ${verified}/${fields.length} fields in tab ${id}.` +
+              `\n${result.fields.map(field => `${field.ref}: ${field.status}${field.reason ? ` — ${field.reason}` : ''}`).join('\n')}` +
+              (result.stopped ? `\n${result.stopped}\nInspect uncertain fields before continuing. No actions were replayed.` : '')
+            return await withFreshSnapshot(id, message, 'browser_fill', false)
           })
         } catch (err) {
           debugLog.error('agent', 'browser_fill', err)
@@ -842,7 +848,7 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
           if (!entry) return { error: `no file at ${path}` }
 
           const requested = mode ?? 'auto'
-          if (artifacts && isHtmlArtifactEntry(entry) && (requested === 'auto' || requested === 'file')) {
+          if (!isOfflineSubagent && artifacts && isHtmlArtifactEntry(entry) && (requested === 'auto' || requested === 'file')) {
             try {
               const shot = await artifacts.screenshot(path, { signal })
               return {
@@ -991,10 +997,12 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
     }),
 
     sandbox_exec: tool({
-      description:
+      description: isOfflineSubagent
+        ? 'Run async JavaScript with top-level await, persistent state, and local workspace files. Use this to read and analyze complete datasets, filter records, and save results. api.fs.readText(path, {offset?, maxChars?}) returns a string; api.fs.extractText(path, {offset?, maxChars?}) returns {path, text, truncated, totalChars} for pagination; api.fs.readLines(path, {startLine?, count?}) returns string[]; api.fs.list(rootOrPath?) returns entries; api.fs.writeText(path, text) saves results. Paths live under /workspace and /skills. Local api.fs operations, api.storage.get/set, and bundled api.pdf, api.zip, api.bytes are available. Browser APIs, network requests, URL imports, remote libraries, extensions, and live artifacts are unavailable. Return only relevant output; paginate until truncated is false when reviewing an entire file. intent is a short user-facing description of the work.'
+        :
         'Persistent personal functions use apps.<id>.<method>(input); inspect source/contracts with api.extensions.get({id}) or discover with api.extensions.list({query}). Read /skills/repl-extensions/SKILL.md before creating/editing one. API handles are scoped to ONE execution. Saved helpers must accept the current api as an argument (state.get = (client, url) => client.fetch(url); await state.get(api, url)); do not retain api, api.fetch, or functions closing over api across calls. Data and pure functions may persist in state. ' +
-        '`intent` is shown to the user while the code runs — make it accurate. Run async JavaScript in a sandbox with top-level await, a persistent `state` object (survives across calls), and an injected `api` (api.history, api.bookmarks, api.tabs, api.downloads, api.fs, api.cdp(tabId,method,params), api.page.*, api.fetch, api.require, plus bundled-locally api.pdf (pdf-lib), api.zip (JSZip), api.bytes (base64/Uint8Array helpers — no Node Buffer)). Top-level const/let lasts only for ONE call — persist values with `state.foo = …` or `globalThis.foo = …`, never by redeclaring. `await api.require(url)` fetches + evaluates a UMD/IIFE library build (e.g. pdf-lib) ONCE per session and caches it by URL — use it instead of re-fetching/new Function every call (dynamic import() is blocked). USE THIS for searching history/bookmarks/files, reading uploaded files, loading skills, bulk or filtered operations, or anything that would otherwise take many tool calls. Filter and aggregate INSIDE the snippet and return only what matters — output is truncated at ' +
-        `${MAX_TOOL_OUTPUT} chars in the visible result; when the VFS spill succeeds, the marker names the file holding the complete returned value, and otherwise says recovery is unavailable. Console arguments are summarized before collection, so return recoverable data instead of only logging it. A single trailing expression is auto-returned.\n\n${SANDBOX_API_CHEATSHEET}`,
+        '`intent` is shown to the user while the code runs — make it accurate. Run async JavaScript in a sandbox with top-level await, a persistent `state` object (survives across calls), and an injected `api` (api.history, api.bookmarks, api.tabs, api.downloads, api.fs, api.cdp(tabId,method,params), api.page.*, api.fetch, api.require, plus bundled-locally api.pdf (pdf-lib), api.zip (JSZip), api.bytes (base64/Uint8Array helpers — no Node Buffer)). Top-level const/let lasts only for ONE call — persist values with `state.foo = …`. Use state for session data, not global variables. `await api.require(url)` fetches + evaluates a UMD/IIFE library build (e.g. pdf-lib) and caches it by URL — use it instead of re-fetching/new Function every call (dynamic import() is blocked). USE THIS for searching history/bookmarks/files, reading uploaded files, loading skills, bulk or filtered operations, or anything that would otherwise take many tool calls. Filter and aggregate INSIDE the snippet and return only what matters — output is truncated at ' +
+        `${MAX_TOOL_OUTPUT} chars in the visible result; when the VFS spill succeeds, the marker names the file holding the complete returned value, and otherwise says recovery is unavailable. Console arguments are summarized before collection, so return recoverable data instead of only logging it. Auto-return works only when the ENTIRE snippet is one bare expression on one line without semicolons. For statements or multiline code, use an explicit return.\n\n${SANDBOX_API_CHEATSHEET}`,
       inputSchema: z.object({
         // First property on purpose: it streams before `code`, so the UI can label
         // the call from the intent alone while the snippet is still arriving.
@@ -1041,10 +1049,11 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
               )
             } else {
               const errText = result.error ?? 'unknown sandbox error'
-              parts.push(errText.startsWith('Error: ') ? errText : `Error: ${errText}`)
+              // Preserve failure classification even when partial work logged.
+              parts.unshift(errText.startsWith('Error: ') ? errText : `Error: ${errText}`)
             }
             return await spillToolOutput('sandbox_exec', parts.join('\n\n'))
-          })
+          }, false) // Individual browser API calls acquire their own leases.
         } catch (err) {
           debugLog.error('agent', 'sandbox_exec', err)
           return errStr(err)
@@ -1062,9 +1071,8 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
   // activate, close, move, or group Chrome tabs.
   if (isSubagent) delete tools.browser_tabs
 
-  // A subagent without a prepared page is genuinely offline-only. Removing
-  // these tools is the runtime backstop: it cannot navigate a New Tab through
-  // direct browser tools, tab creation, sandbox browser APIs, or URL imports.
+  // Offline subagents can compute over local files. The sandbox dispatcher
+  // enforces their local-only API scope; direct browser tools stay unavailable.
   if (isOfflineSubagent) {
     for (const name of [
       'browser_snapshot',
@@ -1077,7 +1085,6 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
       'browser_wait',
       'browser_screenshot',
       'filesystem_import_url',
-      'sandbox_exec',
     ]) {
       delete tools[name]
     }
@@ -1087,7 +1094,7 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
   if (!isSubagent) {
     tools.workflow_run = tool({
       description:
-        'Run a dynamic JavaScript workflow when a hard task benefits from 3+ coordinated subagents, prompt reuse, fan-out/fan-in, or feeding one result into another. The restricted script has args plus agent(prompt, options), parallel([...thunks]), pipeline(items, mapper), phase(id), and log(message). It has NO direct api.* browser/filesystem access. At most 10 agents may be started. Inline scripts are persisted and their returned source path can be rerun with scriptPath. Workflows run synchronously unless background:true; background workflows use task_wait/task_status/task_cancel. Workflow messaging is not supported.',
+        'Run a dynamic JavaScript workflow (Ultracode) when a hard task benefits from 3+ coordinated subagents, prompt reuse, fan-out/fan-in, or feeding one result into another. The restricted script has args plus agent(prompt, options), parallel([...thunks]), pipeline(items, mapper), phase(id), and log(message). It has NO direct api.* browser/filesystem access. At most 10 agents may be started. Inline scripts are persisted and their returned source path can be rerun with scriptPath. Workflows run synchronously unless background:true; background workflows use task_wait/task_status/task_cancel. Workflow messaging is not supported.',
       inputSchema: z.object({
         title: z.string().optional().describe('Short user-facing workflow title. Required with inline script; omitted with scriptPath.'),
         description: z.string().optional().describe('One-sentence workflow purpose. Required with inline script; omitted with scriptPath.'),
@@ -1133,7 +1140,7 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
 
     tools.subagent_spawn = tool({
       description:
-        'Delegate a self-contained sub-task to a subagent. It starts fresh with only the task string and assigned tabs, and cannot spawn subagents. Browser work requires a prepared tab already at a nonblank URL. Passing tabIds:[] creates an offline-only subagent with no browser access. With background:true it returns a task id for task_status/task_wait.',
+        'Delegate a self-contained sub-task to a subagent. It starts fresh with only the task string and assigned tabs, and cannot spawn subagents. Browser work requires a prepared tab already at a nonblank URL. Delegation hands your temporary tab claims to the subagent; tabs owned by another subagent still conflict. Passing tabIds:[] creates an offline-only subagent with no browser access. With background:true it returns a task id for task_status/task_wait.',
       inputSchema: z.object({
         task: z.string().describe('The focused sub-task for the subagent to accomplish.'),
         tabIds: z
@@ -1159,7 +1166,7 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
               parentToolCallId: toolCallId,
             })
             return await spillToolOutput('subagent_spawn', result)
-          })
+          }, false) // Delegation transfers ownership; it is not a browser action.
         } catch (err) {
           debugLog.error('agent', 'subagent_spawn', err)
           return errStr(err)
@@ -1340,7 +1347,10 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
 
     tools.memory_write = tool({
       description:
-        'Save a small amount of reusable context to long-term memory. Two kinds, chosen per entry by whether "scopes" is set. ' +
+        'Explicitly correct, remember, or forget saved context when the user requests it, or register a detailed reusable guide. ' +
+        'Use clearAll:true only when the user explicitly asks to forget all saved memories; this leaves original chats and files intact. ' +
+        'Ordinary conversation and verified tool outcomes are learned automatically in the background; do not call this routinely to record a completed turn. ' +
+        'Legacy file-compatible format has two kinds, chosen per entry by whether "scopes" is set. ' +
         `(1) USER memory (no scopes) → ${MEMORY_PATH}: context that applies everywhere — identity, school or work context, tools and ` +
         'services, standing preferences, stable identifiers, canonical URLs, or a genuinely ongoing course/project. Never save a turn log ' +
         'here: individual emails or people mentioned only to find one, assignments, searches, orders, page state, or what you just did. ' +
@@ -1364,6 +1374,7 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
         'Update an existing title/guide when it changes instead of making near-duplicates. Omitted guide/triggers preserve existing ' +
         'metadata; use guide:"" or triggers:[] to clear it. Forget obsolete entries. Never store passwords, tokens, or other secrets.',
       inputSchema: z.object({
+        clearAll: z.boolean().optional().describe('Explicit user request to forget ALL saved memory. Never use for ordinary cleanup.'),
         memories: z
           .array(
             z.object({
@@ -1410,6 +1421,9 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
               throw new Error(`Guide ${entry.guide} does not exist. Write it with api.fs.writeText before saving the memory.`)
             }
           }
+          const managed = memoryRuntime()
+          if (managed) return await managed.write(input, args.chatId)
+          if (input.clearAll) throw new Error('The memory service is unavailable. Open Settings → Memory and try again.')
           const userMemories = all
             .filter((m) => !m.scopes || m.scopes.length === 0)
             .map(({ title, body }) => ({ title, body }))
@@ -1464,17 +1478,6 @@ export function buildTools(args: BuildToolsArgs): ToolSet {
     })
   }
 
-  if (args.typeSafe) {
-    tools.verify_extraction = tool({
-      description: 'Check extracted facts against their ORIGINAL source with TypeSafe. After extracting structured facts from pages or files, batch the important fields here before relying on them in a final answer or write. Provide verbatim source text, not your summary or the proposed values alone. Each meaning must identify the exact entity/event, requested fact, and relevant units or dates. This checks factual support and entity association; it does not extract new values. Re-read and correct unsupported/uncertain values. An unavailable check is not a pass.',
-      inputSchema: z.object({
-        source: z.string().min(1).max(60_000).describe('Verbatim original evidence, including context needed to identify the entity and interpret the values.'),
-        fields: z.array(z.object({ field: z.string().min(1).max(120), value: z.string().max(2000),
-          meaning: z.string().min(1).max(1000).describe('The entity/event and exact fact this field is intended to represent.') })).min(1).max(24),
-      }),
-      execute: async ({ source, fields }) => JSON.stringify(await verifyExtraction(args.typeSafe!, source, fields)),
-    })
-  }
   return withWellFormedOutputs(tools, signal, operationTracker)
 }
 
@@ -1487,7 +1490,7 @@ function abortGuardCdp(cdp: CdpService, signal: AbortSignal): CdpService {
         throwIfAborted(signal)
         const args = [...rawArgs]
         if (property === 'send') args[3] = signal
-        else if (property === 'click' || property === 'pressKey' || property === 'navigate') args[2] = signal
+        else if (property === 'click' || property === 'pressKey' || property === 'navigate' || property === 'fill') args[2] = signal
         else if (property === 'type' || property === 'evalInFrame') {
           args[3] = { ...((args[3] as object | undefined) ?? {}), signal }
         } else if (property === 'scroll' || property === 'evalInPage') {
@@ -1495,7 +1498,7 @@ function abortGuardCdp(cdp: CdpService, signal: AbortSignal): CdpService {
             ? { ...((args[1] as object | undefined) ?? {}), signal }
             : args[1]
           if (property === 'evalInPage') args[2] = { ...((args[2] as object | undefined) ?? {}), signal }
-        } else if (property === 'attachFiles' || property === 'clickInFrame') args[3] = signal
+        } else if (property === 'attachFiles' || property === 'clickInFrame' || property === 'select') args[3] = signal
         else if (property === 'waitForLoad') args[2] = signal
         return Reflect.apply(value, target, args)
       }

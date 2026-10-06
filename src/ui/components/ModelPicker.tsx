@@ -29,6 +29,7 @@ const CUSTOM = '__custom__'
 
 const MODEL_GROUPS: { provider: CuratedModelProvider; label: string }[] = [
   { provider: 'openai', label: 'OpenAI' },
+  { provider: 'anthropic', label: 'Claude' },
   { provider: 'xai', label: 'xAI' },
   { provider: 'cerebras', label: 'Cerebras' },
   { provider: 'openai-compatible', label: 'Local' },
@@ -111,8 +112,9 @@ export function ModelPicker({
     [groups],
   )
 
-  const isKnownModel = options.some((m) => m.id === modelId)
-  const triggerLabel = options.find((m) => m.id === modelId)?.label ?? modelId
+  const pickerModelId = provider === 'gateway' ? modelId.replace(/^anthropic\//i, '') : modelId
+  const isKnownModel = options.some((m) => m.id === pickerModelId)
+  const triggerLabel = options.find((m) => m.id === pickerModelId)?.label ?? modelId
 
   const select = useCallback(
     (id: string) => {
@@ -186,7 +188,7 @@ export function ModelPicker({
       if (catalogState === 'error') setCatalogAttempt((n) => n + 1)
       setCatalogRequested(true)
     }
-    const start = rows.indexOf(isKnownModel ? modelId : CUSTOM)
+    const start = rows.indexOf(isKnownModel ? pickerModelId : CUSTOM)
     setActiveIndex(start >= 0 ? start : 0)
     setOpen(true)
   }
@@ -224,7 +226,7 @@ export function ModelPicker({
           <div className="model-picker__group-label">{group.label}</div>
           {group.models.map((m) => {
             const index = rows.indexOf(m.id)
-            const selected = isKnownModel && m.id === modelId
+            const selected = isKnownModel && m.id === pickerModelId
             return <button key={m.id} ref={index === activeIndex ? activeRef : undefined} type="button" role="option"
               aria-selected={selected} className={optionClass(index === activeIndex, selected)}
               onMouseEnter={() => setActiveIndex(index)} onClick={() => select(m.id)}>

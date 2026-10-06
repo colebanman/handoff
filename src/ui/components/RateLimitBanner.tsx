@@ -12,6 +12,8 @@ export interface RateLimitStatus {
   /** Timestamp (ms) when the next retry fires. */
   retryAt: number
   message?: string
+  kind?: 'rate-limit' | 'connection'
+  offline?: boolean
 }
 
 export interface ModelOverrideStatus {
@@ -21,9 +23,8 @@ export interface ModelOverrideStatus {
 
 export function formatRemaining(ms: number): string {
   if (ms >= 60_000) {
-    const m = Math.floor(ms / 60_000)
-    const s = Math.round((ms % 60_000) / 1000)
-    return `${m}m ${s}s`
+    const seconds = Math.round(ms / 1000)
+    return `${Math.floor(seconds / 60)}m ${seconds % 60}s`
   }
   if (ms >= 10_000) return `${Math.round(ms / 1000)}s`
   return `${(ms / 1000).toFixed(1)}s`
@@ -76,6 +77,20 @@ export function RateLimitBanner({
   const confirmed = modelOverride ?? (pressed ? { modelId: 'grok-4.6', scope: pressed } : undefined)
   const canOfferSwitch = Boolean(showGrokSwitch && onSwitchToGrok && !confirmed)
   const disabled = !hasXaiKey
+
+  if (status.kind === 'connection') {
+    return (
+      <div className="rate-limit" role="status">
+        <div className="rate-limit__row">
+          <span className="rate-limit__dot" aria-hidden="true" />
+          <span className="rate-limit__text">
+            {status.offline ? 'Internet connection lost — waiting to reconnect' : 'Connection interrupted — retrying automatically'}
+          </span>
+        </div>
+        <p className="rate-limit__hint">Your task is saved. It will continue when the connection returns.</p>
+      </div>
+    )
+  }
 
   const onPick = (scope: ModelSwitchScope): void => {
     if (disabled || !onSwitchToGrok) return

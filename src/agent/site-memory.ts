@@ -175,21 +175,56 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-const compiled = new Map<string, RegExp>()
+type GlobToken = { literal: string } | { star: 'segment' | 'path' | 'host' }
+const compiled = new Map<string, { host: GlobToken[]; path: GlobToken[]; root?: GlobToken[] }>()
+
+function globTokens(pattern: string, host = false): GlobToken[] {
+  const result: GlobToken[] = []
+  const chars = Array.from(pattern.toLowerCase())
+  for (let i = 0; i < chars.length; i++) {
+    if (chars[i] !== '*') result.push({ literal: chars[i]! })
+    else if (!host && chars[i + 1] === '*') { result.push({ star: 'path' }); i++ }
+    else result.push({ star: host ? 'host' : 'segment' })
+  }
+  return result
+}
+
+/** Bounded NFA matching avoids catastrophic RegExp backtracking on learned globs. */
+function globMatches(tokens: GlobToken[], text: string): boolean {
+  let active = new Uint8Array(tokens.length + 1), next = new Uint8Array(tokens.length + 1)
+  active[0] = 1
+  const close = (states: Uint8Array) => { for (let i = 0; i < tokens.length; i++) if (states[i] && 'star' in tokens[i]!) states[i + 1] = 1 }
+  close(active)
+  for (const char of text.toLowerCase()) {
+    next.fill(0)
+    let any = false
+    for (let i = 0; i < tokens.length; i++) {
+      if (!active[i]) continue
+      const token = tokens[i]!
+      if ('literal' in token) { if (token.literal === char) { next[i + 1] = 1; any = true } }
+      else if (token.star === 'path' || (char !== '/' && (token.star !== 'host' || char !== '.'))) { next[i] = 1; any = true }
+    }
+    if (!any) return false
+    close(next); [active, next] = [next, active]
+  }
+  return active[tokens.length] === 1
+}
 
 export function scopeMatches(scope: string, url: string): boolean {
   const normalized = normalizeUrlForScope(url)
-  if (!normalized) return false
-  let re = compiled.get(scope)
-  if (!re) {
-    try {
-      re = scopeToRegExp(scope)
-    } catch {
-      return false
-    }
-    compiled.set(scope, re)
+  if (!normalized || scope.length > 1_024 || normalized.length > 4_096) return false
+  let pattern = compiled.get(scope)
+  if (!pattern) {
+    const slash = scope.indexOf('/')
+    const host = slash < 0 ? scope : scope.slice(0, slash)
+    const path = slash < 0 ? '/**' : scope.slice(slash)
+    pattern = { host: globTokens(host, true), path: globTokens(path), ...(path.endsWith('/**') ? { root: globTokens(path.slice(0, -3)) } : {}) }
+    if (compiled.size >= 2_048) compiled.delete(compiled.keys().next().value!)
+    compiled.set(scope, pattern)
   }
-  return re.test(normalized)
+  const slash = normalized.indexOf('/')
+  const host = slash < 0 ? normalized : normalized.slice(0, slash), path = slash < 0 ? '' : normalized.slice(slash)
+  return globMatches(pattern.host, host) && (globMatches(pattern.path, path) || !!pattern.root && globMatches(pattern.root, path))
 }
 
 /** Literal characters in a scope: the crude but stable specificity measure. */

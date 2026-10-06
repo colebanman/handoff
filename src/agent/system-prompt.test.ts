@@ -6,7 +6,8 @@ describe('main-agent memory scaffolding', () => {
     const prompt = buildSystemPrompt({ isSubagent: false })
     expect(prompt.dynamicPrompt).toBe('')
     expect(prompt.staticPrompt).toContain('<context source="harness">')
-    expect(prompt.staticPrompt).toContain('Read one entry or several')
+    expect(prompt.staticPrompt).toContain('Relevant cross-chat memory arrives automatically')
+    expect(prompt.staticPrompt).toContain('omitted ids are unchanged')
     expect(prompt.staticPrompt).not.toContain('Workspace files:')
     expect(prompt.staticPrompt).not.toContain('What you remember about this user')
   })
@@ -27,6 +28,8 @@ describe('main-agent memory scaffolding', () => {
     })
 
     expect(prompt.dynamicPrompt).toContain('OFFLINE-ONLY')
+    expect(prompt.dynamicPrompt).toContain('sandbox_exec for JavaScript computation')
+    expect(prompt.dynamicPrompt).toContain('local api.fs reads/writes')
     expect(prompt.dynamicPrompt).toContain('Do not attempt to open or navigate a site')
     expect(prompt.dynamicPrompt).toContain('(none assigned — do not touch any tab)')
   })

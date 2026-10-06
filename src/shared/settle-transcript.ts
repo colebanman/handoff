@@ -5,7 +5,7 @@ export function settleTranscriptScope(items: TranscriptItem[], reason = 'Agent e
   return items.map((item) => {
     if ((item.kind === 'text' || item.kind === 'reasoning') && item.streaming) return { ...item, streaming: false }
     if (item.kind === 'compaction' && item.status === 'running') return { ...item, status: 'cancelled' }
-    if (item.kind === 'tool' && item.status === 'running') return { ...item, status: 'error', output: item.output ?? reason }
+    if (item.kind === 'tool' && item.status === 'running') return { ...item, status: 'error', inputStreaming: false, output: item.output ?? reason }
     return item
   })
 }

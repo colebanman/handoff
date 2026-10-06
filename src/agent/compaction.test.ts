@@ -34,7 +34,26 @@ function sse(parts: unknown[]) {
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
 describe('OpenAI compaction through real SDK and agent loop', () => {
-  it('compacts at 40%, preserves the full canonical window across turns and leaves history intact', async () => {
+  it('keeps a request below 90% intact and compacts one above it', async () => {
+    const makeRequest = async (chars: number): Promise<string[]> => {
+      const compaction = new OpenAICompaction({ modelId: 'gpt-4o', contextWindow: 1000,
+        agentId: 'main', signal: new AbortController().signal, emit: () => {} })
+      compaction.prepare([], () => {})
+      const urls: string[] = []
+      const send: typeof fetch = async (url) => {
+        urls.push(String(url))
+        return String(url).endsWith('/compact') ? Response.json({ output: [compactItem] }) : Response.json({})
+      }
+      await compaction.wrapFetch(send)('https://example.com/responses', {
+        body: JSON.stringify({ model: 'gpt-4o', input: [{ role: 'user', content: 'x'.repeat(chars) }] }),
+      })
+      return urls
+    }
+    expect(await makeRequest(2000)).toEqual(['https://example.com/responses'])
+    expect(await makeRequest(2800)).toEqual(['https://example.com/responses/compact', 'https://example.com/responses'])
+  })
+
+  it('compacts at 90%, preserves the full canonical window across turns and leaves history intact', async () => {
     vi.stubGlobal('__DEV_BUILD__', false)
     vi.stubGlobal('chrome', { tabs: { query: async () => [] } })
     const requests: Array<{ url: string; body: any }> = []
@@ -43,7 +62,7 @@ describe('OpenAI compaction through real SDK and agent loop', () => {
       return url.endsWith('/compact')
         ? Response.json({ output, usage: { output_tokens: 20 } }) : sse(events())
     })
-    const history: ModelMessage[] = [{ role: 'user', content: 'Remember orchard-731. ' + 'history '.repeat(23_000) }]
+    const history: ModelMessage[] = [{ role: 'user', content: 'Remember orchard-731. ' + 'history '.repeat(45_000) }]
     const original = structuredClone(history)
     const emitted: AgentEvent[] = []
     const options: RunLoopOptions = {
@@ -90,7 +109,7 @@ describe('OpenAI compaction through real SDK and agent loop', () => {
     const messages = compaction.prepare([{ role: 'user', content: 'history '.repeat(200) }], () => {})
     const result = streamText({ model, messages, providerOptions: { openai: { store: false } } })
     expect(await result.text).toBe('orchard-731')
-    expect(request.context_management).toEqual([{ type: 'compaction', compact_threshold: 400 }])
+    expect(request.context_management).toEqual([{ type: 'compaction', compact_threshold: 900 }])
     const saved = compaction.takeCheckpoint()!
     expect(saved).toBeDefined()
     const next = compaction.prepare([...messages, saved, { role: 'user', content: 'Continue' }], () => {})
@@ -119,8 +138,8 @@ describe('OpenAI compaction through real SDK and agent loop', () => {
       pendingStatuses.push([...emitted])
       return sse(events())
     }) }).responses('gpt-4o')
-    // The local estimate exceeds 40%, but the server's rendered token count
-    // does not. Enabling context_management is not a compaction-start event.
+    // Enabling context_management is not a compaction-start event; only a
+    // streamed compaction item confirms that the server compacted.
     const history: ModelMessage[] = [{ role: 'user', content: 'history '.repeat(200) }]
     for (let step = 0; step < 3; step++) {
       const result = streamText({ model, messages: compaction.prepare(history, () => {}) })
@@ -129,7 +148,7 @@ describe('OpenAI compaction through real SDK and agent loop', () => {
       history.push(...(await result.response).messages, { role: 'user', content: 'Continue' })
     }
     expect(requests).toHaveLength(3)
-    expect(requests.every((request) => request.context_management[0].compact_threshold === 400)).toBe(true)
+    expect(requests.every((request) => request.context_management[0].compact_threshold === 900)).toBe(true)
     expect(pendingStatuses).toEqual([[], [], []])
     expect(emitted).toEqual([])
     expect(compaction.takeCheckpoint()).toBeUndefined()
@@ -155,7 +174,7 @@ describe('OpenAI compaction through real SDK and agent loop', () => {
     const commit = vi.fn()
     const compaction = new OpenAICompaction({ modelId: 'gpt-4o', contextWindow: 1000, agentId: 'main', signal: controller.signal, emit })
     compaction.prepare([], commit)
-    const init = { body: JSON.stringify({ model: 'gpt-4o', input: [{ role: 'user', content: 'x'.repeat(2000) }] }) }
+    const init = { body: JSON.stringify({ model: 'gpt-4o', input: [{ role: 'user', content: 'x'.repeat(3000) }] }) }
     await expect(compaction.wrapFetch(async () => Response.json({}, { status: 500 }))('https://api.openai.com/v1/responses', init)).rejects.toThrow('compaction failed')
     expect(emit.mock.calls.at(-1)?.[0].status).toBe('error')
     expect(commit).not.toHaveBeenCalled()

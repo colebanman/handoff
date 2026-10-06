@@ -64,7 +64,7 @@ const ASSIGNMENT = 'school.instructure.com/courses/123/assignments/456'
 
 const SAMPLE: SiteMemoryEntry[] = [
   { title: 'Canvas — assignment bodies load in a lazy iframe', scopes: [CANVAS], body: 'Snapshot after 1s.', date: '2026-09-01' },
-  { title: 'COURSE 101 — class rules for examples', scopes: [COURSE, 'school.instructure.com/api/v1/courses/123/**'], body: 'MA firms only. See /workspace/sites/course101.md', date: '2026-09-08' },
+  { title: 'COURSE 101 — class rules for examples', scopes: [COURSE, 'school.instructure.com/api/v1/courses/123/**'], body: 'Regional firms only. See /workspace/sites/course101.md', date: '2026-09-08' },
   { title: 'COURSE 101 case memo — project context', scopes: [ASSIGNMENT], body: 'Group of 3; due Oct 2.', date: '2026-09-08' },
 ]
 
@@ -156,7 +156,7 @@ describe('upsert', () => {
     const { entries, addedTitles, updatedTitles } = upsertSiteMemories(
       SAMPLE,
       [
-        { title: 'course 101: class rules for examples', scopes: [COURSE], body: 'MA firms only; cite the syllabus.' },
+        { title: 'course 101: class rules for examples', scopes: [COURSE], body: 'Regional firms only; cite the syllabus.' },
         { title: 'New thing', scopes: ['example.com'], body: 'x' },
       ],
       new Date('2026-09-09T12:00:00'),
@@ -179,7 +179,7 @@ describe('applySiteMemoryWrite', () => {
   it('creates the file on first write and reports spans', async () => {
     const { vfs, writes } = fakeVfs()
     const result = await applySiteMemoryWrite(vfs, {
-      memories: [{ title: 'COURSE 101 — class rules', scopes: ['https://school.instructure.com/courses/123/'], body: 'MA firms only.' }],
+      memories: [{ title: 'COURSE 101 — class rules', scopes: ['https://school.instructure.com/courses/123/'], body: 'Regional firms only.' }],
     })
     expect(result.addedTitles).toEqual(['COURSE 101 — class rules'])
     expect(result.entries[0]!.scopes).toEqual(['school.instructure.com/courses/123'])
@@ -215,7 +215,7 @@ describe('injection block', () => {
     expect(block).toContain('title="COURSE 101 — class rules for examples"')
     expect(block).toContain('lines="')
     expect(block).not.toContain('case memo')
-    expect(block).toContain('MA firms only')
+    expect(block).toContain('Regional firms only')
     expect(siteMemoryBlock(parsed, 'https://mail.google.com')).toBe('')
   })
 

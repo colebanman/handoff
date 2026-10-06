@@ -20,14 +20,14 @@
  *   `subagent_message` on a cancelled task reopens it and re-runs the loop from
  *   that snapshot plus the new message — stop preserves context.
  *
- * Subagents step down from Astra → Sol → Terra → Luna: delegated sub-tasks are
+ * Subagents step down from GPT-6 Astra → GPT-5.6 Sol → Terra → Luna: delegated sub-tasks are
  * narrower than the parent's job, and the cheaper grade is a deliberate
  * cost/latency choice. Other models delegate unchanged. A session model
  * override (e.g. rate-limit banner → Grok for subagents) still wins.
  *
  * Each subagent exclusively claims its assigned browser tabs while it runs.
- * Claims are released on success, error, or cancellation. A tab held by another
- * running agent, including a main-agent soft claim, cannot be delegated.
+ * Claims are released on success, error, or cancellation. Delegation transfers
+ * the parent's temporary soft claims; tabs held by another agent cannot be delegated.
  */
 
 import type { ModelMessage } from 'ai'
@@ -103,7 +103,7 @@ const SUBAGENT_MODEL: Record<string, string> = {
 }
 
 /**
- * The model a subagent runs on: Astra → Sol → Terra → Luna (Luna stays Luna),
+ * The model a subagent runs on: GPT-6 Astra → GPT-5.6 Sol → Terra → Luna,
  * any vendor prefix preserved; every other model id
  * passes through unchanged. Applied BEFORE the session override, so an
  * explicit "switch subagents to Grok" still wins.
@@ -143,6 +143,7 @@ async function closeSubagentTabs(ctx: AgentContext, scopeTabIds: number[]): Prom
 
 export interface SpawnSubagentContext {
   parentAgentId: string
+  parentSurfaceOwnerId?: string
   /** Chat whose turn is spawning; recorded on background tasks so user stop can cancel them. */
   chatId: string
   /** Parent's allowed tabs (undefined for the main agent = unrestricted). */
@@ -205,6 +206,7 @@ export function makeSpawnSubagent(sctx: SpawnSubagentContext): SubagentControls 
   }): void => {
     const { taskId, childCtx, messages, task, parentToolCallId, signal, scopeTabIds, keepTabs } = args
     void runLoop({
+      chatId: sctx.chatId,
       ctx: childCtx,
       settings: sctx.settings,
       modelId: resolveDesiredModelId(subagentModelFor(sctx.settings.modelId), true, sctx.getModelOverride?.()),
@@ -274,14 +276,13 @@ export function makeSpawnSubagent(sctx: SpawnSubagentContext): SubagentControls 
 
   /**
    * One wording for every tab conflict. The main agent's soft
-   * claim reads as "currently being used by the main agent" so the model
-   * finishes its own work on that surface (or hands it over) instead of
-   * waiting on a task that does not exist.
+   * claim from another agent reads as "currently being used" instead of
+   * suggesting a wait on a background task that does not exist.
    */
   const conflictError = (conflict: { surface: AgentSurface; ownerAgentId: string; soft: boolean }): string => {
     const what = describeSurface(conflict.surface)
     if (conflict.soft) {
-      return `Error: ${what} is currently being used by the ${conflict.ownerAgentId} agent. Finish or hand off your own work on it before delegating it, or assign the subagent a different surface.`
+      return `Error: ${what} is currently being used by the ${conflict.ownerAgentId} agent. Assign the subagent a different prepared tab, or wait for that agent to finish.`
     }
     return `Error: ${what} is already assigned to another running subagent (${conflict.ownerAgentId}). Use a different prepared tab, or wait for the other subagent to finish (task_wait).`
   }
@@ -340,7 +341,9 @@ export function makeSpawnSubagent(sctx: SpawnSubagentContext): SubagentControls 
     const childAgentId = `sub-${uid('a')}`
 
     const surfaces = allowedTabIds.map(tabSurface)
-    const conflict = sctx.tabAssignments.claimSurfaces(childAgentId, surfaces)
+    // Preparing or reading the page takes a soft claim. This spawn is the
+    // parent's explicit handoff, not a competing request for its own tab.
+    const conflict = sctx.tabAssignments.claimSurfaces(childAgentId, surfaces, { handoffFromAgentId: sctx.parentSurfaceOwnerId ?? sctx.parentAgentId })
     if (conflict) {
       return conflictError(conflict)
     }
@@ -464,7 +467,7 @@ export function makeSpawnSubagent(sctx: SpawnSubagentContext): SubagentControls 
       }
     }
     const resumeSurfaces = resumeTabIds.map(tabSurface)
-    const conflict = sctx.tabAssignments.claimSurfaces(info.agentId, resumeSurfaces)
+    const conflict = sctx.tabAssignments.claimSurfaces(info.agentId, resumeSurfaces, { handoffFromAgentId: sctx.parentSurfaceOwnerId ?? sctx.parentAgentId })
     if (conflict) {
       return `Error: cannot resume task ${taskId} — ${describeSurface(conflict.surface)} is now held by ${conflict.ownerAgentId}.`
     }

@@ -15,7 +15,9 @@ export function ownPanel(
       const channel = new BroadcastChannel(PANEL_CHANNEL)
       channel.onmessage = (event) => {
         if (event.data !== 'focus') return
-        void chrome.windows.getCurrent().then((win) => {
+        void chrome.tabs.getCurrent().then(async (tab) => {
+          if (tab?.id !== undefined) await chrome.tabs.update(tab.id, { active: true })
+          const win = await chrome.windows.getCurrent()
           if (win.id !== undefined) return chrome.windows.update(win.id, { focused: true })
         }).catch(console.error)
       }

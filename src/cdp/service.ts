@@ -24,6 +24,9 @@ import { keyEventSequence, parseCombo } from './keys'
 import { abortableDelay, throwIfAborted } from '../shared/abort'
 import { ActivityCursor, estimateTabStripX } from './activity-cursor'
 import { loadActivityCursorMode, subscribeActivityCursorMode } from '../storage/settings'
+import { fillForm } from './form-fill'
+import { formTargetCanFocus, formTargetHasFocus, formTargetReceivesPointer } from './form-target'
+import type { FormField, FormFillResult } from '../shared/form-fill'
 
 const CDP_VERSION = '1.3'
 const ENABLE_TIMEOUT_MS = 10_000
@@ -69,7 +72,7 @@ interface EvaluateResult {
   }
 }
 
-/** True when Runtime.evaluate failed at compile time (snippet never ran). */
+/** Only use this on Runtime.compileScript results, never runtime exceptions. */
 function isSyntaxError(ex: NonNullable<EvaluateResult['exceptionDetails']>): boolean {
   const desc = ex.exception?.description ?? ex.text ?? ''
   return ex.exception?.className === 'SyntaxError' || desc.startsWith('SyntaxError')
@@ -575,13 +578,11 @@ export class CdpServiceImpl implements CdpService {
         } catch (err) {
           const msg = errMsg(err)
           if (isDetachedError(msg)) {
-            // Reattach once and retry.
-            debugLog.log('cdp', `retrying ${method} on tab ${tabId} after detach`)
-            this.attached.delete(tabId)
-            throwIfAborted(signal)
-            await this.attach(tabId)
-            throwIfAborted(signal)
-            return await timeout(rawSend<T>(tabId, method, params), COMMAND_TIMEOUT_MS, `${method} on tab ${tabId} (after reattach)`)
+            // A lost response is not proof that a click, write, or evaluated
+            // script did not execute. Reattach on the NEXT explicit operation.
+            this.attached?.delete(tabId)
+            this.tabState?.delete(tabId)
+            throw new Error(`${msg}. ${method} was not replayed; it may have executed. Take a fresh browser_snapshot and inspect the actual effects before retrying.`)
           }
           throw err
         }
@@ -751,88 +752,142 @@ export class CdpServiceImpl implements CdpService {
 
   async click(tabId: number, ref: string, signal?: AbortSignal): Promise<void> {
     const backendNodeId = this.resolveRef(tabId, ref)
+    await this.clickNode(tabId, backendNodeId, signal)
+    debugLog.log('cdp', `click ${ref} on tab ${tabId}`)
+  }
+
+  private async clickNode(tabId: number, backendNodeId: number, signal?: AbortSignal, waitForCursor = true): Promise<void> {
     const { x, y } = await this.centerOf(tabId, backendNodeId, signal)
     // Let the pointer reach the target before the press lands under it. Bounded
     // and cosmetic: any failure resolves immediately.
-    await this.activityCursor.showAndWait(tabId, { kind: 'move', x, y }, signal)
-    // Optional hover to trigger hover handlers.
-    await this.send(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' }, signal)
-    await this.send(tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, signal)
-    await this.send(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, signal)
-    debugLog.log('cdp', `click ${ref} on tab ${tabId}`, { x: Math.round(x), y: Math.round(y) })
+    if (waitForCursor) await this.activityCursor.showAndWait(tabId, { kind: 'move', x, y }, signal)
+    else this.activityCursor.show(tabId, { kind: 'move', x, y }, signal)
+    await withoutStickyOverlay(tabId, false, async () => {
+      // Hover can open a menu or move the target; test after it, immediately
+      // before pressing. Apply this to ordinary clicks as well as form fills.
+      await this.send(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' }, signal)
+      const resolved = await this.send<ResolveNodeResult>(tabId, 'DOM.resolveNode', { backendNodeId }, signal)
+      const objectId = resolved.object?.objectId
+      if (!objectId) throw new Error('Target detached before click; no click was dispatched')
+      try {
+        const hit = await this.send<EvaluateResult>(tabId, 'Runtime.callFunctionOn', {
+          objectId, returnByValue: true, arguments: [{ value: x }, { value: y }],
+          functionDeclaration: formTargetReceivesPointer.toString(),
+        }, signal)
+        if (hit.result?.value !== true) throw new Error('Target is covered, disabled or moved; no click was dispatched. Inspect a fresh browser_snapshot before continuing.')
+        await this.send(tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, signal)
+        await this.send(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, signal)
+      } finally {
+        try { await this.send(tabId, 'Runtime.releaseObject', { objectId }) } catch { /* navigation */ }
+      }
+    })
   }
 
   /** Focus the element behind a backendNodeId (DOM.focus, fall back to JS click-free focus). */
   private async focusNode(tabId: number, backendNodeId: number, signal?: AbortSignal): Promise<string | undefined> {
-    // Resolve to a JS object for later input/change dispatch, and focus it.
-    let objectId: string | undefined
+    const resolved = await this.send<ResolveNodeResult>(tabId, 'DOM.resolveNode', { backendNodeId }, signal)
+    const objectId = resolved.object?.objectId
+    if (!objectId) throw new Error('Input detached before focus; no text was dispatched')
     try {
-      const resolved = await this.send<ResolveNodeResult>(tabId, 'DOM.resolveNode', { backendNodeId }, signal)
-      objectId = resolved.object?.objectId
-    } catch {
-      objectId = undefined
-    }
-    try {
-      await this.send(tabId, 'DOM.focus', { backendNodeId }, signal)
-    } catch (err) {
-      // Fall back to focusing via JS if DOM.focus is unsupported for the node.
-      if (objectId) {
+      // Avoid asking Chrome to focus a control that became disabled/hidden
+      // since its snapshot; focus is then either ignored or fails.
+      const ready = await this.send<EvaluateResult>(tabId, 'Runtime.callFunctionOn', {
+        objectId, returnByValue: true, functionDeclaration: formTargetCanFocus.toString(),
+      }, signal)
+      if (ready.result?.value !== true) throw new Error('Input is hidden, disabled or readonly; no text was dispatched')
+      try {
+        await this.send(tabId, 'DOM.focus', { backendNodeId }, signal)
+      } catch {
+        // The caller verifies actual focus before emitting any key events.
         await this.send(tabId, 'Runtime.callFunctionOn', {
           objectId,
           functionDeclaration: 'function(){ this.focus && this.focus(); }',
           awaitPromise: false,
         }, signal)
-      } else {
-        debugLog.log('cdp', `focus failed (continuing)`, errMsg(err))
       }
+      return objectId
+    } catch (error) {
+      try { await this.send(tabId, 'Runtime.releaseObject', { objectId }) } catch { /* detached */ }
+      throw error
     }
-    return objectId
   }
 
   async type(tabId: number, ref: string, text: string, opts?: { clear?: boolean; submit?: boolean; signal?: AbortSignal }): Promise<void> {
-    const signal = opts?.signal
     const backendNodeId = this.resolveRef(tabId, ref)
+    await this.typeNode(tabId, backendNodeId, text, opts)
+    debugLog.log('cdp', `type ${ref} on tab ${tabId}`, { len: text.length, clear: !!opts?.clear, submit: !!opts?.submit })
+  }
+
+  private async typeNode(tabId: number, backendNodeId: number, text: string, opts?: { clear?: boolean; submit?: boolean; signal?: AbortSignal }, waitForCursor = true): Promise<void> {
+    const signal = opts?.signal
     const at = await this.centerOf(tabId, backendNodeId, signal) // scroll into view
     // Travel to the field before focusing it, so typing doesn't appear from nowhere.
-    await this.activityCursor.showAndWait(tabId, { kind: 'move', x: at.x, y: at.y }, signal)
+    if (waitForCursor) await this.activityCursor.showAndWait(tabId, { kind: 'move', x: at.x, y: at.y }, signal)
+    else this.activityCursor.show(tabId, { kind: 'move', x: at.x, y: at.y }, signal)
     const objectId = await this.focusNode(tabId, backendNodeId, signal)
 
-    if (opts?.clear) {
-      // Select-all then Backspace (framework-safe clearing); cmd+a on macOS.
-      await this.dispatchKey(SELECT_ALL_COMBO, tabId, signal)
-      // Native editing shortcuts can be intercepted (or mapped differently by
-      // Chrome/macOS). Select standard text controls explicitly before deleting
-      // so clear never silently leaves a prefix behind. Keep the keyboard path
-      // for contenteditable and input types without selection support.
+    try {
+      if (!objectId) throw new Error('Input detached before typing; no text was dispatched')
+      const focused = await this.send<EvaluateResult>(tabId, 'Runtime.callFunctionOn', {
+        objectId, returnByValue: true,
+        functionDeclaration: formTargetHasFocus.toString(),
+      }, signal)
+      if (focused.result?.value !== true) throw new Error('Input could not be focused or is not editable; no text was dispatched')
+
+      if (opts?.clear) {
+        // Select-all then Backspace (framework-safe clearing); cmd+a on macOS.
+        await this.dispatchKey(SELECT_ALL_COMBO, tabId, signal)
+        // Native editing shortcuts can be intercepted (or mapped differently by
+        // Chrome/macOS). Select standard text controls explicitly before deleting
+        // so clear never silently leaves a prefix behind. Keep the keyboard path
+        // for contenteditable and input types without selection support.
+        if (objectId) {
+          await this.send(tabId, 'Runtime.callFunctionOn', {
+            objectId,
+            functionDeclaration: 'function(){ if ((this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement) && this.selectionStart !== null) this.select(); }',
+            awaitPromise: false,
+          }, signal)
+        }
+        await this.dispatchKey('Backspace', tabId, signal)
+      }
+
+      // Text is data, not a sequence of navigation/submit keys. Characters
+      // without a reliable physical-key mapping use Chrome's native insertion.
+      for (const ch of [...text.replace(/\r\n?/g, '\n')]) {
+        await this.typeChar(tabId, ch, signal)
+      }
+
+      // Dispatch bubbling synthetic input + change so frameworks reconcile state.
       if (objectId) {
         await this.send(tabId, 'Runtime.callFunctionOn', {
           objectId,
-          functionDeclaration: 'function(){ if ((this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement) && this.selectionStart !== null) this.select(); }',
+          functionDeclaration:
+            'function(){ this.dispatchEvent(new Event("input", {bubbles:true,composed:true})); this.dispatchEvent(new Event("change", {bubbles:true,composed:true})); }',
           awaitPromise: false,
         }, signal)
       }
-      await this.dispatchKey('Backspace', tabId, signal)
-    }
 
-    // Per-character real key events so React/Vue listeners fire.
-    for (const ch of [...text]) {
-      await this.typeChar(tabId, ch, signal)
+      if (opts?.submit) {
+        await this.dispatchKey('Enter', tabId, signal)
+      }
+    } finally {
+      if (objectId) {
+        try { await this.send(tabId, 'Runtime.releaseObject', { objectId }) } catch { /* navigation */ }
+      }
     }
+  }
 
-    // Dispatch bubbling synthetic input + change so frameworks reconcile state.
-    if (objectId) {
-      await this.send(tabId, 'Runtime.callFunctionOn', {
-        objectId,
-        functionDeclaration:
-          'function(){ this.dispatchEvent(new Event("input", {bubbles:true})); this.dispatchEvent(new Event("change", {bubbles:true})); }',
-        awaitPromise: false,
-      }, signal)
-    }
+  async fill(tabId: number, fields: FormField[], signal?: AbortSignal): Promise<FormFillResult> {
+    return await fillForm({
+      resolve: ref => this.resolveRef(tabId, ref),
+      send: (method, params) => this.send(tabId, method, params, method === 'Runtime.releaseObjectGroup' ? undefined : signal),
+      click: backendNodeId => this.clickNode(tabId, backendNodeId, signal, false),
+      type: (backendNodeId, text, clear) => this.typeNode(tabId, backendNodeId, text, { clear, signal }, false),
+    }, fields, signal)
+  }
 
-    if (opts?.submit) {
-      await this.dispatchKey('Enter', tabId, signal)
-    }
-    debugLog.log('cdp', `type ${ref} on tab ${tabId}`, { len: text.length, clear: !!opts?.clear, submit: !!opts?.submit })
+  async select(tabId: number, ref: string, option: string, signal?: AbortSignal): Promise<FormFillResult> {
+    return this.fill(tabId, [{ ref, select: option }], signal)
   }
 
   async attachFiles(
@@ -993,8 +1048,14 @@ export class CdpServiceImpl implements CdpService {
     return new Error(String(detail))
   }
 
-  /** Dispatch a single printable character as keyDown+char+keyUp. */
+  /** Insert literal text; synthesize physical keys only for safe mappings. */
   private async typeChar(tabId: number, ch: string, signal?: AbortSignal): Promise<void> {
+    if (!/^[a-zA-Z0-9 ]$/.test(ch)) {
+      // E.g. '&' -> virtual key 38 (ArrowUp), '\t' -> Tab, and emoji cannot
+      // be represented as one UTF-16 key token. Never dispatch these as keys.
+      await this.send(tabId, 'Input.insertText', { text: ch }, signal)
+      return
+    }
     // Space uses the named table; other single chars map to themselves.
     const base = ch === ' ' ? 'space' : ch
     const events = keyEventSequence(base, 0)
@@ -1249,19 +1310,19 @@ export class CdpServiceImpl implements CdpService {
         awaitPromise: true,
       })
     }
-    // Two-pass wrapper (same contract as api.page.eval): expression form
-    // first so bare expressions produce a value; statement form on
-    // SyntaxError (safe to re-run — the snippet never executed).
+    // Compile without executing to distinguish expressions from statements.
+    // A runtime SyntaxError (JSON.parse, response.json, etc.) can follow a
+    // successful mutation and must never cause the script to execute twice.
     const asStatements = `(async () => { ${expression} })()`
     let res: EvaluateResult
     if (opts?.statement) {
       res = await evaluate(asStatements)
     } else {
-      res = await evaluate(`(async () => { return (${expression}\n) })()`)
-      if (res.exceptionDetails && isSyntaxError(res.exceptionDetails)) {
-        throwIfAborted(signal)
-        res = await evaluate(asStatements)
-      }
+      const asExpression = `(async () => { return (${expression}\n) })()`
+      const compiled = await send<EvaluateResult>('Runtime.compileScript', {
+        expression: asExpression, sourceURL: '', persistScript: false, executionContextId: contextId,
+      })
+      res = await evaluate(compiled.exceptionDetails && isSyntaxError(compiled.exceptionDetails) ? asStatements : asExpression)
     }
     if (res.exceptionDetails) {
       const ex = res.exceptionDetails
@@ -1335,16 +1396,11 @@ export class CdpServiceImpl implements CdpService {
     if (opts?.statement) {
       res = await evaluate(asStatements)
     } else {
-      // Pass 1: treat the snippet as a single expression so bare expressions
-      // (`document.title`) produce a value instead of a silent undefined.
-      // The newline guards against a trailing `//` comment eating the paren.
-      res = await evaluate(`(async () => { return (${expression}\n) })()`)
-      if (res.exceptionDetails && isSyntaxError(res.exceptionDetails)) {
-        // Pass 2: statement form. Safe to re-run — a SyntaxError means
-        // pass 1 never executed any of the snippet.
-        throwIfAborted(signal)
-        res = await evaluate(asStatements)
-      }
+      const asExpression = `(async () => { return (${expression}\n) })()`
+      const compiled = await this.send<EvaluateResult>(tabId, 'Runtime.compileScript', {
+        expression: asExpression, sourceURL: '', persistScript: false,
+      }, signal)
+      res = await evaluate(compiled.exceptionDetails && isSyntaxError(compiled.exceptionDetails) ? asStatements : asExpression)
     }
     if (res.exceptionDetails) {
       const ex = res.exceptionDetails

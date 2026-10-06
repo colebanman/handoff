@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { MockLanguageModelV3 } from 'ai/test'
-import { withModelIdleTimeout, ModelIdleTimeoutError } from './model-idle-timeout'
+import { withModelIdleTimeout, ModelIdleTimeoutError, MODEL_TOOL_INPUT_IDLE_TIMEOUT_MS } from './model-idle-timeout'
 
 type Part = Awaited<ReturnType<MockLanguageModelV3['doStream']>>['stream'] extends ReadableStream<infer T> ? T : never
 
@@ -13,6 +13,26 @@ const finish: Part = {
 afterEach(() => vi.useRealTimers())
 
 describe('model inactivity timeout', () => {
+  it('uses a shorter idle deadline while awaiting tool submission, without counting heartbeats as progress', async () => {
+    vi.useFakeTimers()
+    let source!: ReadableStreamDefaultController<Part>
+    const model = new MockLanguageModelV3({ doStream: async () => ({ stream: new ReadableStream<Part>({ start(c) { source = c } }) }) })
+    const guarded = withModelIdleTimeout(model) as MockLanguageModelV3
+    const reader = (await guarded.doStream(params)).stream.getReader()
+    source.enqueue({ type: 'tool-input-start', id: 'read', toolName: 'sandbox_exec' })
+    await reader.read()
+    source.enqueue({ type: 'tool-input-delta', id: 'read', delta: '{"code":"return 1"}' })
+    await reader.read()
+    await vi.advanceTimersByTimeAsync(MODEL_TOOL_INPUT_IDLE_TIMEOUT_MS - 1)
+    source.enqueue({ type: 'response-metadata', id: 'heartbeat' })
+    await reader.read()
+    const rejected = expect(reader.read()).rejects.toThrow('no response progress for 30 seconds')
+    await vi.advanceTimersByTimeAsync(1)
+    await rejected
+    expect(model.doStreamCalls[0]!.abortSignal?.aborted).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it('aborts a provider that never returns headers, even if it ignores abort', async () => {
     vi.useFakeTimers()
     const model = new MockLanguageModelV3({ doStream: () => new Promise(() => {}) })
@@ -75,6 +95,9 @@ describe('model inactivity timeout', () => {
     { type: 'response-metadata', id: 'queued-response' },
     { type: 'raw', rawValue: { type: 'ping' } },
     { type: 'text-delta', id: 'text', delta: '' },
+    { type: 'text-delta', id: 'text', delta: ' \n\t' },
+    { type: 'reasoning-delta', id: 'thought', delta: ' \n\t' },
+    { type: 'tool-input-delta', id: 'tool', delta: ' \n\t' },
   ])('does not let $type without output postpone the deadline', async (part) => {
     vi.useFakeTimers()
     let source!: ReadableStreamDefaultController<Part>

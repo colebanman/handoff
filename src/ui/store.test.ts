@@ -198,6 +198,15 @@ describe('existing-user memory bootstrap', () => {
       ),
     ).toBe(true)
   })
+
+  it('can personalize for a connected Claude subscription without an OpenAI credential', () => {
+    const settings = {
+      ...DEFAULT_SETTINGS, provider: 'anthropic' as const, modelId: 'claude-opus-5-5',
+      anthropicAuthMode: 'claude' as const, apiKey: '', apiKeys: { anthropic: 'inactive-paid-key' },
+    }
+    expect(hasOnboardingSetupCredential(settings, false, true)).toBe(true)
+    expect(hasOnboardingSetupCredential(settings, false, false)).toBe(false)
+  })
 })
 
 describe('blocking user prompts (store wiring)', () => {

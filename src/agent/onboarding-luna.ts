@@ -63,6 +63,7 @@ import {
 } from './memory'
 import { resolveModel, resolveModelAccess } from './models'
 import { listChatGPTModels } from './openai-chatgpt-oauth'
+import { personalizationMemory } from './continuity-personalization'
 
 /** Pinned: this pass is a cheap one-shot regardless of which model the chat runs. */
 export const LUNA_MODEL_ID = 'gpt-5.6-luna'
@@ -355,7 +356,7 @@ export async function collectOnboardingSignals(): Promise<string> {
 /* The prompt                                                          */
 /* ------------------------------------------------------------------ */
 
-const LUNA_SYSTEM_PROMPT = `You are Handoff’s setup assistant, running one-time setup for Handoff — a browser agent that lives in this user's Chrome side panel. You are given a digest of the data Chrome already holds about them: open tabs, the last 30 days of history grouped by site, bookmarks, recent downloads. You write the extension's first long-term memories and its first starter prompts, and then you stop. You will not be asked anything else.
+const LUNA_SYSTEM_PROMPT = `You are Luna, running one-time setup for Handoff — a browser agent that lives in this user's Chrome side panel. You are given a digest of the data Chrome already holds about them: open tabs, the last 30 days of history grouped by site, bookmarks, recent downloads. You write the extension's first long-term memories and its first starter prompts, and then you stop. You will not be asked anything else.
 
 Reply with STRICT JSON and nothing else — no prose, no explanation, no markdown fences:
 
@@ -685,7 +686,7 @@ async function attempt(
     digestChars: digest.length,
     existingMemories: existingEntries.length,
   })
-  const text = await runLuna(model, digest, serializeMemoryForPrompt(existingEntries), signal)
+  const text = await runLuna(model, digest, await personalizationMemory(deps.vfs, digest), signal)
   const parsed = parseLunaOutput(text)
   debugLog.log('agent', 'luna parsed', {
     memories: parsed.memories.length,

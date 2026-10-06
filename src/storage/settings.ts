@@ -17,7 +17,12 @@ export async function loadSettings(): Promise<Settings> {
     await chrome.storage.local
       .remove(LEGACY_SUBSCRIPTION_TOKEN_KEY)
       .catch((err) => debugLog.error('storage', 'remove legacy subscription tokens', err))
-    return normalizeSettings({ ...DEFAULT_SETTINGS, ...(out[KEY] as Partial<Settings> | undefined) })
+    const stored = out[KEY] as (Partial<Settings> & { typeSafeEnabled?: boolean; typeSafeApiKey?: string }) | undefined
+    const normalized = normalizeSettings({ ...DEFAULT_SETTINGS, ...stored })
+    if (stored && ('typeSafeEnabled' in stored || 'typeSafeApiKey' in stored)) {
+      await chrome.storage.local.set({ [KEY]: normalized })
+    }
+    return normalized
   } catch (err) {
     debugLog.error('storage', 'loadSettings', err)
     return { ...DEFAULT_SETTINGS }

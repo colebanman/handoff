@@ -2,8 +2,8 @@
  * Request-time workaround for providers that cannot carry media in tool
  * results.
  *
- * xAI's Responses API only accepts strings as `function_call_output`;
- * @ai-sdk/xai converts `content`-typed tool outputs by concatenating the text
+ * The installed xAI Responses adapter emits string `function_call_output`;
+ * it converts `content`-typed tool outputs by concatenating the text
  * items and mapping media items to '' — so a screenshot tool result would
  * silently reach grok as an empty string. `inlineMediaToolResults` rewrites
  * request copies: each image media item in a tool result becomes a text
@@ -15,16 +15,27 @@
  * Applied per step via `prepareStep`, on request copies only — persisted
  * history keeps the original media outputs, so switching the chat back to a
  * media-capable provider restores native delivery.
+ * Provider contracts: https://developers.openai.com/api/docs/guides/function-calling
+ * https://docs.x.ai/developers/model-capabilities/images/understanding
+ * https://inference-docs.cerebras.ai/capabilities/image-inputs
  */
 
 import type { ModelMessage, ToolResultPart, UserModelMessage } from 'ai'
 import type { ProviderKind } from '../shared/types'
 
-/** Whether tool results may carry media for this provider/model. */
+/** Transport capability, not whether the model has vision. Keep OpenAI
+ * Responses' native image/file tool outputs and Gateway's structured outputs;
+ * Chat Completions tool messages cannot carry image content parts. */
 export function supportsMediaToolResults(provider: ProviderKind, modelId: string): boolean {
   const id = modelId.trim().toLowerCase()
-  // Cerebras Chat Completions also requires screenshots in user image parts.
-  return !(provider === 'cerebras' || provider === 'xai' || (provider === 'gateway' && id.startsWith('xai/')))
+  switch (provider) {
+    case 'anthropic': return true // Messages supports native image/document tool_result blocks.
+    case 'openai': return true // Platform and ChatGPT both use Responses.
+    case 'openai-compatible': // @ai-sdk/openai.chat serializes tool media as JSON text.
+    case 'cerebras': // Chat Completions: images belong in user content.
+    case 'xai': return false // Responses adapter otherwise drops tool images.
+    case 'gateway': return !id.startsWith('xai/')
+  }
 }
 
 interface InlinedImage {
@@ -40,9 +51,24 @@ interface InlinedImage {
 export function inlineMediaToolResults(messages: ModelMessage[]): ModelMessage[] {
   let changed = false
   const out: ModelMessage[] = []
+  const pendingImages: InlinedImage[] = []
+  const flushImages = () => {
+    if (!pendingImages.length) return
+    out.push({
+      role: 'user',
+      content: pendingImages.flatMap((img) => [
+        { type: 'text' as const, text: `Image output of tool call ${img.toolCallId}:` },
+        { type: 'image' as const, image: img.data, mediaType: img.mediaType },
+      ]),
+    } satisfies UserModelMessage)
+    pendingImages.length = 0
+  }
 
   for (const message of messages) {
     if (message.role !== 'tool' || !Array.isArray(message.content)) {
+      // Parallel calls can have separate adjacent tool messages. Chat
+      // Completions needs ALL their replies before the next user message.
+      flushImages()
       out.push(message)
       continue
     }
@@ -59,12 +85,12 @@ export function inlineMediaToolResults(messages: ModelMessage[]): ModelMessage[]
           images.push({ toolCallId: part.toolCallId, data: item.data, mediaType: item.mediaType })
           return {
             type: 'text' as const,
-            text: '[Image output: attached as an image in the user message that follows this tool result.]',
+            text: '[Image output: attached as an image in the user message after these tool results.]',
           }
         }
         return {
           type: 'text' as const,
-          text: `[Media output of type ${item.mediaType} omitted: the current model cannot receive non-image files from tools.]`,
+          text: `[Media output of type ${item.mediaType} omitted: this transport cannot deliver native non-image tool files. Use filesystem_view with mode:"text" or, for PDFs, mode:"pdf-page" to inspect the content.]`,
         }
       })
       return { ...part, output: { ...part.output, value } } satisfies ToolResultPart
@@ -77,17 +103,9 @@ export function inlineMediaToolResults(messages: ModelMessage[]): ModelMessage[]
 
     changed = true
     out.push({ ...message, content })
-    if (images.length > 0) {
-      const userMessage: UserModelMessage = {
-        role: 'user',
-        content: images.flatMap((img) => [
-          { type: 'text', text: `Image output of tool call ${img.toolCallId}:` },
-          { type: 'image', image: img.data, mediaType: img.mediaType },
-        ]),
-      }
-      out.push(userMessage)
-    }
+    pendingImages.push(...images)
   }
+  flushImages()
 
   return changed ? out : messages
 }

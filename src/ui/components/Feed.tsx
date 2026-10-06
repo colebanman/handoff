@@ -3,7 +3,9 @@
  * user scrolls up, it detaches and shows a "Jump to latest" pill. Clicking the
  * pill (or scrolling back to the bottom) re-pins.
  *
- * Pinning is paint-time (no animated scroll — animated scroll fights the user).
+ * Pinning is paint-time (no animated scroll — animated scroll fights the user),
+ * and it holds through the timeline's height animations: those grow rows
+ * between React renders, so a ResizeObserver re-pins on every size change.
  *
  * Empty state: one centered question plus starter-prompt chips that AUTOFILL the
  * composer (never send — a one-click send from a guess is not a favor). Props
@@ -12,22 +14,9 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react'
 import type { TranscriptItem } from '../../shared/types'
 import { TranscriptList, type AgentWaits } from './items'
+import { useAwaitingModel } from '../hooks/useAwaitingModel'
 
 const BOTTOM_THRESHOLD = 40 // px from bottom still counts as "pinned"
-
-/** Presentation-only wait: never add a synthetic reasoning step to history. */
-function waitingForFirstOutput(items: TranscriptItem[]): boolean {
-  for (let index = items.length - 1; index >= 0; index--) {
-    const item = items[index]!
-    // Steering belongs to the current turn, not a new response wait.
-    if (item.kind === 'user' && (item.pending || item.steered)) continue
-    // A text-start event can arrive before there is anything to display.
-    if (item.kind === 'text' && !item.text.trim()) continue
-    if (item.kind === 'reasoning' && !item.streaming && !item.durationMs && !item.text.trim()) continue
-    return item.kind === 'user'
-  }
-  return true
-}
 
 export function Feed({
   items,
@@ -64,7 +53,9 @@ export function Feed({
   const scrollerRef = useRef<HTMLDivElement>(null)
   const pinnedRef = useRef(true)
   const [detached, setDetached] = useState(false)
-  const thinking = streaming && !agentWaits?.main && waitingForFirstOutput(items)
+  // Any pause in a running turn shows as a Thinking row (presentation only —
+  // never a synthetic item in history). A rate-limit wait has its own banner.
+  const pending = useAwaitingModel(items, !!streaming) && !agentWaits?.main
 
   const scrollToBottom = useCallback((): void => {
     const el = scrollerRef.current
@@ -89,7 +80,20 @@ export function Feed({
       const el = scrollerRef.current
       if (el) el.scrollTop = el.scrollHeight
     }
-  }, [items, thinking])
+  }, [items, pending])
+
+  // …and while content resizes on its own (rows easing open, images loading).
+  const innerRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const el = scrollerRef.current
+    const inner = innerRef.current
+    if (!el || !inner || typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(() => {
+      if (pinnedRef.current) el.scrollTop = el.scrollHeight
+    })
+    observer.observe(inner)
+    return () => observer.disconnect()
+  }, [])
 
   // Pin on first mount.
   useEffect(() => {
@@ -99,7 +103,7 @@ export function Feed({
 
   return (
     <div className="feed" ref={scrollerRef} onScroll={onScroll}>
-      <div className="feed__inner">
+      <div className="feed__inner" ref={innerRef}>
         {items.length === 0 && !streaming ? (
           <div className="feed__empty">
             {/* Two lines when we have a name: the break is the greeting's beat,
@@ -159,17 +163,13 @@ export function Feed({
           <TranscriptList
             items={items}
             streaming={streaming}
+            pending={pending}
             agentWaits={agentWaits}
             subagentModelBadge={subagentModelBadge}
             onRevert={onRevert}
             onOpenFile={onOpenFile}
           />
         )}
-        {thinking ? (
-          <div className="feed__thinking" role="status" aria-live="polite">
-            <span className="shine">Thinking…</span>
-          </div>
-        ) : null}
       </div>
       {detached ? (
         <button className="jump-latest" onClick={scrollToBottom} aria-label="Jump to latest">

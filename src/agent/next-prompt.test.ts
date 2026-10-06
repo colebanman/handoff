@@ -10,8 +10,8 @@ describe('next-prompt sanitize', () => {
   it('passes a plain suggestion through untouched, preserving the user’s style', () => {
     // Deliberately lowercase and abbreviated: "correcting" this would defeat the
     // entire point of feeding the model voice samples.
-    expect(sanitize('can u check my example college assignments too')).toBe(
-      'can u check my example college assignments too',
+    expect(sanitize('can u check my college assignments too')).toBe(
+      'can u check my college assignments too',
     )
   })
 
@@ -26,8 +26,8 @@ describe('next-prompt sanitize', () => {
   })
 
   it('strips code fences and takes the first line with content', () => {
-    expect(sanitize('```\nnow do the same for my Example College english class\n```')).toBe(
-      'now do the same for my Example College english class',
+    expect(sanitize('```\nnow do the same for my college english class\n```')).toBe(
+      'now do the same for my college english class',
     )
     expect(sanitize('\n\nopen the supabase sql editor\nsecond line ignored')).toBe(
       'open the supabase sql editor',
@@ -36,7 +36,7 @@ describe('next-prompt sanitize', () => {
 
   it('strips self-added quotes and list markers', () => {
     expect(sanitize('"summarize the anth final project"')).toBe('summarize the anth final project')
-    expect(sanitize('“check my example university canvas”')).toBe('check my example university canvas')
+    expect(sanitize('“check my university canvas”')).toBe('check my university canvas')
     expect(sanitize('- push that to a file')).toBe('push that to a file')
     expect(sanitize('> push that to a file')).toBe('push that to a file')
   })

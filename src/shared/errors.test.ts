@@ -13,7 +13,7 @@ function apiCallError(statusCode: number, responseBody: string): Error {
 
 describe('formatErrorWithStack', () => {
   it("surfaces a FastAPI `detail` that the SDK message throws away", () => {
-    // Example of a local model server context-overflow response. Without this
+    // Example response from a local server's context-overflow guard. Without this
     // the debug log shows only "Bad Request" and the cause is unrecoverable.
     const body = JSON.stringify({
       detail: 'prompt is 45231 tokens, over the served limit of 32768',

@@ -23,6 +23,7 @@
   "permissions": [
     "alarms",
     "debugger",
+    "declarativeNetRequestWithHostAccess",
     "tabs",
     "tabGroups",
     "history",

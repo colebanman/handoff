@@ -28,6 +28,8 @@ import {
 } from './openai-chatgpt-oauth'
 import { debugLog } from '../shared/debug-log'
 import { tapFetch } from '../shared/stream-tap'
+import { getValidClaudeCredentials, type ClaudeCredentials } from './anthropic-oauth'
+import { createAnthropicModel } from './anthropic-transport'
 
 /** Keep the raw-stream tap and its wrapper out of non-developer bundles. */
 function developerFetch(base?: typeof fetch): typeof fetch | undefined {
@@ -72,7 +74,7 @@ export function withPriorityServiceTier(base?: typeof fetch): typeof fetch {
 export function resolveProviderSettings(settings: Settings, modelId: string): Settings {
   const id = modelId.trim()
   if (settings.provider === 'gateway' && !isLocalModelId(id) && id !== CEREBRAS_DEFAULT_MODEL_ID) {
-    const gatewayId = id.includes('/') ? id : id.startsWith('grok') ? `xai/${id}` : `openai/${id}`
+    const gatewayId = normalizeGatewayModelId(id)
     return { ...settings, modelId: gatewayId }
   }
   // Request-time resolution, so a locally served model materializes its pinned
@@ -83,6 +85,7 @@ export function resolveProviderSettings(settings: Settings, modelId: string): Se
 export interface ResolvedModelAccess {
   settings: Settings
   chatgptCredentials?: ChatGPTCredentials
+  claudeCredentials?: ClaudeCredentials
 }
 
 function providerKey(settings: Settings, provider: Settings['provider']): string {
@@ -94,6 +97,8 @@ function providerKey(settings: Settings, provider: Settings['provider']): string
 }
 
 function apiKeySettings(settings: Settings, provider: Settings['provider'], modelId: string): Settings | undefined {
+  // A subscription selection never implicitly enables paid Anthropic API use.
+  if (provider === 'anthropic' && settings.anthropicAuthMode !== 'api-key') return undefined
   if (provider === 'openai-compatible' && isLocalModelId(modelId)) {
     return pinnedSettingsForModel(modelId, settings, { pinEndpoint: true })
   }
@@ -110,17 +115,23 @@ function apiKeySettings(settings: Settings, provider: Settings['provider'], mode
 }
 
 /**
- * Resolve a requested model without making ChatGPT login a hard dependency.
- * Order: ChatGPT session, saved OpenAI Platform key, current-chat provider,
- * then any other provider with a configured key.
+ * Resolve a model's credentials. Claude subscription selections fail closed;
+ * they cannot activate a saved paid key. Legacy OpenAI helpers can fall back
+ * to the current chat provider, including its Claude subscription.
  */
 export async function resolveModelAccess(
   settings: Settings,
   requestedModelId: string,
   loadChatGPTCredentials: () => Promise<ChatGPTCredentials> = getValidChatGPTCredentials,
+  loadClaudeCredentials: () => Promise<ClaudeCredentials> = getValidClaudeCredentials,
 ): Promise<ResolvedModelAccess> {
   const requested = resolveProviderSettings(settings, requestedModelId)
   let chatgptError: unknown
+
+  if (requested.provider === 'anthropic' && requested.anthropicAuthMode !== 'api-key') {
+    const claudeCredentials = await loadClaudeCredentials()
+    return { settings: { ...requested, apiKey: '' }, claudeCredentials }
+  }
 
   if (requested.provider === 'openai' && requested.openaiAuthMode === 'chatgpt') {
     try {
@@ -144,6 +155,10 @@ export async function resolveModelAccess(
   // Pinned helper models (Luna) should use the model the current chat already
   // runs when their preferred OpenAI credential is unavailable.
   const currentSettings = resolveProviderSettings(settings, settings.modelId)
+  if (currentSettings.provider === 'anthropic' && currentSettings.anthropicAuthMode !== 'api-key') {
+    const claudeCredentials = await loadClaudeCredentials()
+    return { settings: { ...currentSettings, apiKey: '' }, claudeCredentials }
+  }
   const current = apiKeySettings(currentSettings, currentSettings.provider, currentSettings.modelId)
   if (current) {
     debugLog.log('agent', 'requested model unavailable; using current model', {
@@ -155,7 +170,8 @@ export async function resolveModelAccess(
   }
 
   const fallbackModels: Array<[Settings['provider'], string]> = [
-    ['openai', requested.modelId],
+    ['openai', requested.provider === 'openai' ? requested.modelId : 'gpt-6-luna'],
+    ['anthropic', 'claude-sonnet-5-5'],
     ['xai', MODEL_OPTIONS.find((model) => model.provider === 'xai')?.id ?? 'grok-4.6'],
     ['cerebras', CEREBRAS_DEFAULT_MODEL_ID],
     ['gateway', settings.modelId],
@@ -178,16 +194,18 @@ export async function resolveModelAccess(
 }
 
 /** Synchronous mirror for UI gates; actual OAuth validation stays in the resolver. */
-export function hasModelAccess(settings: Settings, requestedModelId: string, chatgptConnected: boolean): boolean {
+export function hasModelAccess(settings: Settings, requestedModelId: string, chatgptConnected: boolean, claudeConnected = false): boolean {
   const requested = resolveProviderSettings(settings, requestedModelId)
+  if (requested.provider === 'anthropic' && requested.anthropicAuthMode !== 'api-key') return claudeConnected
   if (requested.provider === 'openai' && requested.openaiAuthMode === 'chatgpt') {
     if (chatgptConnected || providerKey(settings, 'openai')) return true
   } else if (requested.apiKey?.trim() && (requested.provider !== 'openai-compatible' || requested.baseURL?.trim())) {
     return true
   }
   const current = resolveProviderSettings(settings, settings.modelId)
+  if (current.provider === 'anthropic' && current.anthropicAuthMode !== 'api-key' && claudeConnected) return true
   if (apiKeySettings(current, current.provider, current.modelId)) return true
-  return (['openai', 'xai', 'cerebras', 'gateway', 'openai-compatible'] as const).some((provider) =>
+  return (['openai', 'anthropic', 'xai', 'cerebras', 'gateway', 'openai-compatible'] as const).some((provider) =>
     Boolean(apiKeySettings(settings, provider, settings.modelId)),
   )
 }
@@ -197,6 +215,7 @@ export function hasModelAccess(settings: Settings, requestedModelId: string, cha
  *
  * - gateway            → createGateway({ apiKey })(modelId)   e.g. 'google/gemini-3-pro'
  * - openai             → Platform API key or ChatGPT subscription Responses transport
+ * - anthropic          → native Messages, Claude subscription OAuth or explicit API key
  * - openai-compatible  → createOpenAI({ apiKey, baseURL }).chat(modelId)
  * - xai                → createXai({ apiKey }).responses(modelId)  e.g. 'grok-4.3'
  * - cerebras           → shared inference Chat Completions, with reasoning replay
@@ -205,7 +224,7 @@ export function hasModelAccess(settings: Settings, requestedModelId: string, cha
  */
 export function resolveModel(settings: Settings, chatgptCredentials?: ChatGPTCredentials, wrapFetch?: (base: typeof fetch) => typeof fetch): LanguageModel {
   const apiKey = settings.apiKey?.trim()
-  if (!apiKey) {
+  if (!apiKey && !(settings.provider === 'anthropic' && settings.anthropicAuthMode !== 'api-key')) {
     if (settings.provider === 'openai' && settings.openaiAuthMode === 'chatgpt') {
       throw new Error('No ChatGPT account connected. Open Settings and sign in with ChatGPT.')
     }
@@ -222,6 +241,14 @@ export function resolveModel(settings: Settings, chatgptCredentials?: ChatGPTCre
   debugLog.log('agent', 'resolveModel', { provider: settings.provider, modelId })
 
   switch (settings.provider) {
+    case 'anthropic': {
+      return createAnthropicModel({
+        modelId: modelId.replace(/^anthropic\//, ''),
+        apiKey,
+        oauth: settings.anthropicAuthMode !== 'api-key',
+        fetch: developerFetch(),
+      })
+    }
     case 'gateway': {
       if (wrapFetch && normalizeGatewayModelId(modelId).startsWith('openai/')) {
         return createOpenAI({ apiKey, baseURL: 'https://ai-gateway.vercel.sh/v1',
@@ -307,5 +334,5 @@ function normalizeGatewayModelId(modelId: string): string {
   // priority pick degrades to the standard tier rather than 400-ing.
   const id = stripXaiPrioritySuffix(modelId)
   if (id.includes('/')) return id
-  return id.startsWith('grok') ? `xai/${id}` : `openai/${id}`
+  return id.startsWith('claude-') ? `anthropic/${id}` : id.startsWith('grok') ? `xai/${id}` : `openai/${id}`
 }

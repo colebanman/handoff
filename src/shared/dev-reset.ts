@@ -33,6 +33,7 @@
  */
 
 import { debugLog } from './debug-log'
+import { MEMORY_DB_NAME } from './continuity'
 
 /** Compile-time constant. Guard every call site on this so Rollup can drop it. */
 export const DEV_BUILD: boolean = __DEV_BUILD__
@@ -43,7 +44,7 @@ const SETTINGS_KEY = 'settings'
 /** ChatGPT OAuth token store — key mirrored from src/agent/openai-chatgpt-oauth.ts. */
 const CHATGPT_TOKENS_KEY = 'openai_chatgpt_oauth_tokens'
 
-const CREDENTIAL_KEYS = [SETTINGS_KEY, CHATGPT_TOKENS_KEY] as const
+const CREDENTIAL_KEYS = [SETTINGS_KEY, CHATGPT_TOKENS_KEY, 'anthropic_claude_oauth_tokens'] as const
 
 /** Stamped after a reset so it is obvious in storage which run is a fresh one. */
 const MARKER_KEY = 'devFreshStartAt'
@@ -63,7 +64,7 @@ type DeleteOutcome = 'deleted' | 'blocked' | 'error'
  * no output at all, so a blocked delete gets a short grace period — the close
  * usually happens inside it and `onsuccess` still wins — and then gives up.
  */
-function deleteVfsDatabase(): Promise<DeleteOutcome> {
+function deleteVfsDatabase(name = VFS_DB_NAME): Promise<DeleteOutcome> {
   return new Promise<DeleteOutcome>((resolve) => {
     let settled = false
     const finish = (outcome: DeleteOutcome): void => {
@@ -71,7 +72,7 @@ function deleteVfsDatabase(): Promise<DeleteOutcome> {
       settled = true
       resolve(outcome)
     }
-    const req = indexedDB.deleteDatabase(VFS_DB_NAME)
+    const req = indexedDB.deleteDatabase(name)
     req.onsuccess = () => finish('deleted')
     req.onerror = () => finish('error')
     req.onblocked = () => setTimeout(() => finish('blocked'), BLOCKED_GRACE_MS)
@@ -101,6 +102,7 @@ export async function devFreshReset(opts: { keepCredentials: boolean }): Promise
 
   await chrome.storage.local.clear()
   const vfs = await deleteVfsDatabase()
+  await deleteVfsDatabase(MEMORY_DB_NAME)
   await chrome.storage.local.set({ ...kept, [MARKER_KEY]: Date.now() })
 
   const restored = Object.keys(kept)

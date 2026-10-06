@@ -109,6 +109,26 @@ function post(msg: SandboxToHost): void {
 /* ------------------------------------------------------------------ */
 
 const sessionState = new Map<string, Record<string, unknown>>()
+const sessionGlobals = new Map<string, object>()
+
+/** Legacy snippets used globalThis/window/self for scratch data. Shadow those
+ * aliases per session so normal property writes cannot contaminate another
+ * chat. This is convenience isolation, not a security boundary or a new realm;
+ * supported persistent data still belongs in state. */
+function getGlobals(sessionId: string): object {
+  let globals = sessionGlobals.get(sessionId)
+  if (!globals) {
+    globals = new Proxy(Object.create(null) as Record<PropertyKey, unknown>, {
+      get(target, key) {
+        if (key === 'globalThis' || key === 'window' || key === 'self') return globals
+        return Object.hasOwn(target, key) ? target[key] : Reflect.get(globalThis, key)
+      },
+      set(target, key, value) { target[key] = value; return true },
+    })
+    sessionGlobals.set(sessionId, globals)
+  }
+  return globals
+}
 
 function getState(sessionId: string): Record<string, unknown> {
   let s = sessionState.get(sessionId)
@@ -403,11 +423,12 @@ async function runExec(msg: Extract<HostToSandbox, { kind: 'exec' }>): Promise<v
   try {
     let fn: (...a: unknown[]) => Promise<unknown>
     try {
-      fn = new AsyncFunction('api', 'state', 'console', 'apps', wrapCode(code))
+      fn = new AsyncFunction('api', 'state', 'console', 'apps', 'globalThis', 'window', 'self', `"use strict";\n${wrapCode(code)}`)
     } catch (syntaxErr) {
       throw new Error(`SyntaxError: ${(syntaxErr as Error).message}`)
     }
-    const run = fn(api, state, capturedConsole, extensions.apps)
+    const globals = getGlobals(sessionId)
+    const run = fn(api, state, capturedConsole, extensions.apps, globals, globals, globals)
     const result = await Promise.race([run, timeout])
     value = serializeResult(result)
   } catch (e) {

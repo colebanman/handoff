@@ -7,6 +7,7 @@
  *  - Tool rows are upserted by toolCallId; running -> done morph updates the
  *    same row.
  *  - Reasoning / text deltas accumulate by id.
+ *  - A broken network stream may discard its uncommitted text before retry.
  *  - Subagent events (identified by agentId != 'main') are routed into the
  *    childItems of the spawning tool row. The spawning row is located by the
  *    parentToolCallId carried on the child's 'agent-start' event; thereafter the
@@ -236,7 +237,7 @@ function accumStreamText(
   if (idx === -1) {
     const base: TranscriptItem =
       kind === 'reasoning'
-        ? { kind: 'reasoning', id, agentId, text: delta, streaming: true }
+        ? { kind: 'reasoning', id, agentId, text: delta, streaming: true, at: Date.now() }
         : { kind: 'text', id, agentId, text: delta, streaming: true }
     return [...scope, base]
   }
@@ -304,6 +305,14 @@ export function applyEvent(items: TranscriptItem[], e: AgentEvent): TranscriptIt
       return updateWorkflowAgent(items, e.agentId, (agent) => ({ ...agent, usage: addUsage(agent.usage, e.usage) }))
     }
 
+    case 'connection-restart': {
+      const ids = new Set(e.partIds)
+      const toolIds = new Set(e.toolCallIds)
+      return applyToScope(items, e.agentId, (scope) => scope.filter((item) =>
+        !((item.kind === 'text' || item.kind === 'reasoning') && ids.has(item.id)) &&
+        !(item.kind === 'tool' && item.inputStreaming && item.status === 'running' && toolIds.has(item.id))))
+    }
+
     case 'compaction': {
       return applyToScope(items, e.agentId, (scope) => {
         const item: TranscriptItem = { kind: 'compaction', id: e.id, agentId: e.agentId, status: e.status }
@@ -369,7 +378,7 @@ export function applyEvent(items: TranscriptItem[], e: AgentEvent): TranscriptIt
       return applyToScope(items, e.agentId, (scope) => {
         const exists = scope.some((it) => it.kind === 'reasoning' && it.id === e.id)
         if (exists) return scope
-        return [...scope, { kind: 'reasoning', id: e.id, agentId: e.agentId, text: '', streaming: true }]
+        return [...scope, { kind: 'reasoning', id: e.id, agentId: e.agentId, text: '', streaming: true, at: Date.now() }]
       })
     }
     case 'reasoning-delta': {
@@ -404,6 +413,7 @@ export function applyEvent(items: TranscriptItem[], e: AgentEvent): TranscriptIt
                 agentId: e.agentId,
                 toolName: e.toolName,
                 inputText: '',
+                inputStreaming: true,
                 status: 'running',
                 at: Date.now(),
               },
@@ -434,6 +444,7 @@ export function applyEvent(items: TranscriptItem[], e: AgentEvent): TranscriptIt
                 inputText,
                 input,
                 inputParsedLength,
+                inputStreaming: true,
                 status: 'running',
                 at: Date.now(),
               }
@@ -450,9 +461,13 @@ export function applyEvent(items: TranscriptItem[], e: AgentEvent): TranscriptIt
             agentId: e.agentId,
             toolName: e.toolName,
             inputText,
+            harnessVersion: e.harnessVersion ?? prev?.harnessVersion,
+            executionId: e.executionId ?? prev?.executionId,
             input: e.input,
+            inputStreaming: false,
             status: prev?.status === 'done' || prev?.status === 'error' ? prev.status : 'running',
             durationMs: prev?.durationMs,
+            endedAt: prev?.endedAt,
             output: prev?.output,
             at: prev?.at ?? Date.now(),
             childAgentId: prev?.childAgentId,
@@ -468,7 +483,7 @@ export function applyEvent(items: TranscriptItem[], e: AgentEvent): TranscriptIt
         upsertTool(scope, e.toolCallId, e.agentId, (prev) => {
           const status: ToolStatus = e.isError ? 'error' : 'done'
           return prev
-            ? { ...prev, toolName: e.toolName || prev.toolName, output: e.output, status, durationMs: e.durationMs }
+            ? { ...prev, toolName: e.toolName || prev.toolName, output: e.output, inputStreaming: false, status, durationMs: e.durationMs, endedAt: Date.now() }
             : {
                 kind: 'tool',
                 id: e.toolCallId,
@@ -479,6 +494,7 @@ export function applyEvent(items: TranscriptItem[], e: AgentEvent): TranscriptIt
                 status,
                 durationMs: e.durationMs,
                 at: Date.now(),
+                endedAt: Date.now(),
               }
         }),
       )
@@ -512,15 +528,9 @@ export function applyEvent(items: TranscriptItem[], e: AgentEvent): TranscriptIt
     }
 
     case 'agent-finish': {
-      // Mark any still-streaming reasoning/text in this scope as complete.
-      const marked = applyToScope(items, e.agentId, (scope) =>
-        scope.map((it) => {
-          if ((it.kind === 'reasoning' || it.kind === 'text') && it.streaming) {
-            return { ...it, streaming: false }
-          }
-          return it
-        }),
-      )
+      // An unfinished tool draft must not keep showing Preparing code after
+      // the provider has ended. Separately running child agents keep their state.
+      const marked = applyToScope(items, e.agentId, (scope) => settleTranscriptScope(scope))
       // A finished child agent resolves its spawning row's childStatus. Only
       // background subagents get task-update events, so sync ones end here.
       const withResult = updateWorkflowAgent(marked, e.agentId, (agent) => ({

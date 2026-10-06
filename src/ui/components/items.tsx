@@ -2,23 +2,20 @@
  * Transcript item renderers for the Cursor-Glass-style feed.
  *
  * - UserBubble        : the user's message (surface-recipe bubble, right-aligned)
- * - ReasoningRow      : thinking; shimmering "Thinking…" header + live 2-line
- *                       tail preview while streaming. Finished one-line
- *                       summaries render as a plain "Thought  …" label row
- *                       (nothing more to reveal); longer ones keep the
- *                       "Thought for Xs" collapsible with a markdown body
- * - ToolRow           : one row that morphs running -> done (running = 0.8
- *                       opacity); dim verb + payload; collapsible body with
- *                       per-tool rich renderers (code block for sandbox_exec,
- *                       file pill for VFS paths, screenshot images, JSON
- *                       fallback); delegations render as SubagentCard (metadata
- *                       embed, full transcript in a modal)
+ * - ActivityBlock     : tool calls and thinking as one timeline per run
+ *                       (components/Activity.tsx); ToolBody here renders a
+ *                       step's expanded input/output (code block for
+ *                       sandbox_exec, file pill for VFS paths, screenshot
+ *                       images, JSON fallback)
+ * - ToolRow           : delegations — SubagentCard (metadata embed, full
+ *                       transcript in a modal) and WorkflowCard
  * - AssistantMessage  : streaming markdown (react-markdown + gfm + highlight),
  *                       fenced code rendered via CodeBlock (lang label + copy)
  * - ErrorRow          : danger callout
  * - MemoryChip        : "Remembered X" receipt; opens MEMORY.md
  *
- * Chevron + Dots + CodeBlock are shared building blocks. Motion lives in CSS.
+ * Chevron + CodeBlock are shared building blocks. Motion lives in CSS,
+ * except the activity timeline's (motion/react, see Activity.tsx).
  *
  * Perf: rows are memoized and the reducer preserves item identity for
  * untouched items, so a streaming delta re-renders only the row it changed.
@@ -31,9 +28,13 @@ import { createPortal } from 'react-dom'
 import { fmtDuration } from '../format-duration'
 import { toolResultError, toolResultImage } from '../../shared/tool-results'
 import ReactMarkdown, { type Components } from 'react-markdown'
-import remarkGfm from 'remark-gfm'
+import { MARKDOWN_REMARK_PLUGINS, MARKDOWN_REHYPE_PLUGINS } from '../markdown-plugins'
 import rehypeHighlight from 'rehype-highlight'
 import rehypeMarkdownReveal from '../markdown-reveal'
+import rehypeStreamCaret from '../markdown-caret'
+import rehypeTableLabels from '../markdown-tables'
+import remarkPredictiveMarkdown from '../markdown-predictive'
+import { splitMarkdownBlocks } from '../markdown-blocks'
 import type {
   AgentId,
   TranscriptItem,
@@ -45,11 +46,15 @@ import type {
 import type { BrowserContextAttachment } from '../../shared/browser-events'
 import { artifactNameFromPath, artifactUrl, extractArtifactLinks, isVfsPath } from '../../shared/artifacts'
 import { findSecrets, redactSecrets } from '../../shared/redact'
-import { toolLabel, toolGroupSummary, GROUP_THOUGHT } from '../tool-labels'
+import { describeStep, thoughtLabel } from '../tool-labels'
+import { isActiveItem, isActivityTool, type ActivityItem } from '../activity'
+import { ActivityBlock, type ActivityRenderers } from './Activity'
 import { openMemoryFile } from '../store'
 import { formatRemaining } from './RateLimitBanner'
 import { useVfsImage } from '../hooks/useVfsImage'
 import { settleTranscriptScope } from '../../shared/settle-transcript'
+import { useAwaitingModel } from '../hooks/useAwaitingModel'
+import { reconcileActivityIdentity, type ActivityIdentity } from '../activity-identity'
 
 /** Live rate-limit wait per agent id (structural subset of the store's ChatRateLimit). */
 export interface AgentWait {
@@ -58,6 +63,8 @@ export interface AgentWait {
   message?: string
   /** Subagent holding its request until the main agent's reply goes through. */
   waitingForMain?: boolean
+  kind?: 'rate-limit' | 'connection'
+  offline?: boolean
 }
 
 export type AgentWaits = Record<AgentId, AgentWait>
@@ -78,15 +85,6 @@ export function Chevron({ open }: { open: boolean }): React.ReactElement {
   )
 }
 
-export function Dots(): React.ReactElement {
-  return (
-    <span className="dots" aria-label="working" role="status">
-      <span />
-      <span />
-      <span />
-    </span>
-  )
-}
 
 /** Recursively extract plain text from rendered React children (for copy). */
 function nodeText(n: React.ReactNode): string {
@@ -209,7 +207,7 @@ function compactAttachmentUrl(url?: string): string {
 }
 
 /**
- * Image/appshot embedded in a sent user message. The image is re-read from the
+ * File embedded in a sent user message. Images are re-read from the
  * VFS by path; appshots get a caption bar with the captured tab's title + URL.
  * Clicking opens the file in the file panel.
  */
@@ -220,22 +218,27 @@ const AttachmentEmbed = memo(function AttachmentEmbed({
   attachment: UserAttachment
   onOpenFile?: (path: string) => void
 }): React.ReactElement {
-  const { src, failed } = useVfsImage(attachment.path)
+  const isFile = attachment.kind === 'file'
+  const { src, failed } = useVfsImage(isFile ? '' : attachment.path)
   const isAppshot = attachment.kind === 'appshot'
   const label = isAppshot ? attachment.title || 'TabShot' : attachment.name
   return (
     <button
       type="button"
-      className={`attachment-embed${isAppshot ? ' attachment-embed--appshot' : ''}`}
+      className={`attachment-embed${isAppshot ? ' attachment-embed--appshot' : ''}${isFile ? ' attachment-embed--file' : ''}`}
       onClick={onOpenFile ? () => onOpenFile(attachment.path) : undefined}
       title={`Open ${attachment.name}`}
     >
-      {src ? (
+      {isFile ? (
+        <span className="attachment-embed__file-icon" aria-hidden="true">📄</span>
+      ) : src ? (
         <img className="attachment-embed__img" src={src} alt={label} loading="lazy" />
       ) : (
         <span className="attachment-embed__missing">{failed ? 'Image no longer in workspace' : 'Loading…'}</span>
       )}
-      {isAppshot ? (
+      {isFile ? (
+        <span className="attachment-embed__file-name">{attachment.name}</span>
+      ) : isAppshot ? (
         <span className="attachment-embed__caption">
           <span className="attachment-embed__badge">
             <CameraGlyph />
@@ -361,96 +364,6 @@ export const UserBubble = memo(function UserBubble({
   )
 })
 
-/**
- * Clean a one-line reasoning summary for the collapsed row: markdown emphasis
- * markers and a trailing period stripped, casing left exactly as the model
- * wrote it.
- *
- * This used to lowercase the first letter, because the row read "Thought about
- * {x}" and needed a noun phrase to complete the sentence. Providers do not
- * reliably emit noun phrases — a summary is just as often a finished thought
- * ("Good, closed the tab. Give clear summary"), which that template turned into
- * "Thought about good, closed the tab. Give clear summary". The row now labels
- * the summary instead of absorbing it into a sentence, so no grammar is
- * assumed and the model's own capitalisation survives.
- */
-function reasoningSummary(text: string): string {
-  // Strip PAIRED emphasis/code markers only — a global [*_`] delete would
-  // corrupt snake_case identifiers, which these summaries are full of
-  // ("sandbox_exec" must not become "sandboxexec").
-  let t = text
-    .replace(/\*\*([^*]+)\*\*/g, '$1')
-    .replace(/\*([^*]+)\*/g, '$1')
-    .replace(/`([^`]+)`/g, '$1')
-    .trim()
-  if (t.endsWith('.')) t = t.slice(0, -1).trimEnd()
-  return t
-}
-
-export const ReasoningRow = memo(function ReasoningRow({
-  text,
-  streaming,
-  durationMs,
-}: {
-  text: string
-  streaming: boolean
-  durationMs?: number
-}): React.ReactElement | null {
-  const [open, setOpen] = useState(false)
-  const trimmed = text.trim()
-  // reasoning-start + reasoning-end with no summary deltas: a chevron here
-  // would be a control with nothing behind it. Keep the duration when we
-  // have one; render nothing at all otherwise.
-  if (!streaming && trimmed.length === 0) {
-    if (!durationMs) return null
-    return (
-      <div className="item crow">
-        <div className="reasoning-line">
-          <span className="reasoning-line__text">Thought for {fmtDuration(durationMs)}</span>
-        </div>
-      </div>
-    )
-  }
-  // A finished single-line summary has nothing more to reveal, so it renders
-  // as a plain line instead of an empty collapsible. Label + summary, on the
-  // same verb/payload footing as the tool rows it sits between, rather than a
-  // sentence the summary has to grammatically complete. `title` carries the
-  // full text — the line clamps at two rows in a ~360px panel.
-  if (!streaming && trimmed.length <= 90 && !trimmed.includes('\n')) {
-    return (
-      <div className="item crow">
-        <div className="reasoning-line" title={trimmed}>
-          <span className="reasoning-line__verb">Thought</span>
-          <span className="reasoning-line__text">{reasoningSummary(trimmed)}</span>
-          {durationMs ? <span className="crow__trailing">{fmtDuration(durationMs)}</span> : null}
-        </div>
-      </div>
-    )
-  }
-  const header = streaming ? 'Thinking…' : durationMs ? `Thought for ${fmtDuration(durationMs)}` : 'Thought'
-  return (
-    <div className="item crow">
-      {/* Chevron on the TRAILING edge, not leading — see .crow__header in
-          theme.css: a leading chevron pushed every row's text 18px right of the
-          assistant's prose. */}
-      <button className="crow__header" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
-        <span className={`crow__verb${streaming ? ' shine' : ''}`}>{header}</span>
-        <span className="crow__trailing">
-          <Chevron open={open} />
-        </span>
-      </button>
-      {open && text ? (
-        // Markdown, not raw text: summary parts arrive as bold headlines and
-        // lists, which read as literal asterisks in a plain div.
-        <div className="crow__body reasoning-body reasoning-body--md">
-          <MarkdownBlock text={text} />
-        </div>
-      ) : null}
-      {!open && streaming && text ? <div className="reasoning-preview">{text.slice(-500)}</div> : null}
-    </div>
-  )
-})
-
 /** Pretty-print a value for the tool body. */
 function prettyValue(v: unknown): string {
   if (v === undefined) return ''
@@ -466,8 +379,9 @@ function MarkdownLink({
   href,
   children,
   onOpenFile,
+  node: _node,
   ...props
-}: React.AnchorHTMLAttributes<HTMLAnchorElement> & { onOpenFile?: (path: string) => void }): React.ReactElement {
+}: React.AnchorHTMLAttributes<HTMLAnchorElement> & { onOpenFile?: (path: string) => void; node?: unknown }): React.ReactElement {
   if (href && isVfsPath(href)) {
     // href stays the artifact URL so middle-click and ctrl/cmd/shift-click
     // still open the artifact view in a new tab natively; a plain left click
@@ -668,6 +582,8 @@ function SubagentWaitNote({
   const remaining = wait.retryAt - now
   const text = wait.waitingForMain
     ? 'Rate limited — waiting for main agent reply'
+    : wait.kind === 'connection'
+      ? wait.offline ? 'Connection lost — waiting to reconnect' : `Connection interrupted — ${remaining > 0 ? `retrying in ${formatRemaining(remaining)}` : 'retrying now…'}`
     : modelBadge
       ? `Switching to ${modelBadge}…`
       : `Rate limited — ${remaining > 0 ? `retrying in ${formatRemaining(remaining)}` : 'retrying now…'}`
@@ -691,10 +607,6 @@ export const ToolRow = memo(function ToolRow({
   subagentModelBadge?: string
   onOpenFile?: (path: string) => void
 }): React.ReactElement {
-  const [open, setOpen] = useState(false)
-  const isError = item.status === 'error' || (item.status === 'done' && !!toolResultError(item.output))
-  const { verb, payload } = toolLabel(item.toolName, isError ? 'error' : item.status, item.input, item.output)
-  const running = item.status === 'running'
   const childWait =
     item.childAgentId && item.childStatus === 'running' ? agentWaits?.[item.childAgentId] : undefined
 
@@ -715,32 +627,15 @@ export const ToolRow = memo(function ToolRow({
     )
   }
 
-  const monoPayload =
-    item.toolName === 'browser_click' ||
-    item.toolName === 'browser_type' ||
-    item.toolName === 'browser_fill' ||
-    item.toolName === 'sandbox_exec' ||
-    item.toolName === 'browser_navigate'
-
-  const trailing = (() => {
-    if (running) return <Dots />
-    if (item.durationMs) return <span>{fmtDuration(item.durationMs)}</span>
-    return null
-  })()
-
+  // Plain calls arrive inside activity blocks; one rendered alone gets its own.
   return (
-    <div className={`item crow${isError ? ' crow--error' : ''}${running ? ' crow--running' : ''}`}>
-      <button className="crow__header" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
-        <span className={`crow__verb${running ? ' shine' : ''}`}>{verb}</span>
-        {payload ? <span className={`crow__payload${monoPayload ? ' crow__payload--mono' : ''}`}>{payload}</span> : null}
-        <span className="crow__trailing">
-          {trailing}
-          <Chevron open={open} />
-        </span>
-      </button>
-
-      {open ? <ToolBody item={item} onOpenFile={onOpenFile} /> : null}
-    </div>
+    <ActivityBlock
+      items={[item]}
+      live={item.status === 'running'}
+      pending={false}
+      renderers={ACTIVITY_RENDERERS}
+      onOpenFile={onOpenFile}
+    />
   )
 })
 
@@ -749,17 +644,26 @@ export const ToolRow = memo(function ToolRow({
  * identifies the *step* producing the text (item id + tool status) — the
  * card keys its crossfade on it, so the animation replays when the agent
  * moves to a new step, not on every streamed token of the current one.
+ * A running agent with nothing in progress is between steps: "Thinking…".
  */
-export function subagentTail(items: TranscriptItem[]): { text: string; key: string } {
+export function subagentTail(items: TranscriptItem[], running = false): { text: string; key: string } {
+  if (running && items.length > 0 && !items.some(isActiveItem)) {
+    return { text: 'Thinking…', key: `pause:${items[items.length - 1]!.id}` }
+  }
   for (let i = items.length - 1; i >= 0; i--) {
     const it = items[i]!
-    if (it.kind === 'text' || it.kind === 'reasoning') {
+    if (it.kind === 'text') {
       const t = it.text.trim()
       if (t) return { text: t, key: it.id }
-      if (it.streaming) return { text: it.kind === 'reasoning' ? 'Thinking…' : 'Writing…', key: it.id }
+      if (it.streaming) return { text: 'Writing…', key: it.id }
+    } else if (it.kind === 'reasoning') {
+      if (!it.text.trim() && !it.streaming) continue
+      const { label, placeholder } = thoughtLabel(it.text, it.streaming, it.durationMs)
+      return { text: placeholder ? 'Thinking…' : label, key: placeholder ? it.id : `${it.id}:${label}` }
     } else if (it.kind === 'tool') {
-      const { verb, payload } = toolLabel(it.toolName, it.status, it.input, it.output)
-      return { text: payload ? `${verb} ${payload}` : verb, key: `${it.id}:${it.status}` }
+      const view = describeStep(it)
+      const text = view.placeholder ? 'Thinking…' : view.detail ? `${view.label} ${view.detail}` : view.label
+      return { text, key: `${it.id}:${it.status}` }
     } else if (it.kind === 'error') {
       return { text: it.message, key: it.id }
     }
@@ -1284,15 +1188,29 @@ export function SubagentCard({
   onOpenFile?: (path: string) => void
 }): React.ReactElement {
   const [modalOpen, setModalOpen] = useState(false)
+  const spawnError = toolResultError(item.output)?.message ??
+    (item.status === 'error' && typeof item.output === 'string' ? item.output : undefined)
   const status: 'running' | 'done' | 'error' =
-    item.childStatus ?? (item.status === 'error' ? 'error' : item.status === 'running' ? 'running' : 'done')
+    item.childStatus ?? (item.status === 'error' || spawnError ? 'error' : item.status === 'running' ? 'running' : 'done')
   const running = status === 'running'
   // Persisted transcripts from older builds may still have streaming flags
   // after a terminal task update. The card's terminal state is authoritative.
-  const items = useMemo(() => running ? item.childItems ?? [] : settleTranscriptScope(item.childItems ?? []), [item.childItems, running])
+  const items = useMemo(() => {
+    const childItems = running ? item.childItems ?? [] : settleTranscriptScope(item.childItems ?? [])
+    // A spawn rejected before agent-start has no child transcript. Include
+    // its tool error so the card and modal both explain the failure.
+    if (status === 'error' && spawnError && !childItems.some((child) => child.kind === 'error')) {
+      return [...childItems, {
+        kind: 'error' as const, id: `${item.id}:spawn-error`,
+        agentId: item.childAgentId ?? item.agentId, message: spawnError, at: item.at,
+      }]
+    }
+    return childItems
+  }, [item.childItems, item.id, item.childAgentId, item.agentId, item.at, running, status, spawnError])
   const title = subagentTitle(item.input, item.inputText)
-  const tail = subagentTail(items)
-  const activity = tail.text || (running ? (item.childAgentId ? 'Waiting for model response…' : 'Starting agent…') : status === 'error' ? 'Failed' : 'Done')
+  const tail = subagentTail(items, running)
+  const failure = status === 'error' ? items.filter((child) => child.kind === 'error').at(-1) : undefined
+  const activity = redactSecrets(failure?.message || tail.text || (running ? (item.childAgentId ? 'Thinking…' : 'Starting agent…') : status === 'error' ? 'Failed' : 'Done'))
   // Step identity, not text: keying on the text would remount (and replay the
   // enter animation of) the activity line on every streamed token.
   const activityKey = tail.text ? tail.key : status
@@ -1304,7 +1222,9 @@ export function SubagentCard({
         className={`subagent-card subagent-card--${status}`}
         onClick={() => setModalOpen(true)}
         title={
-          showModelBadge
+          status === 'error'
+            ? `${activity} · Open subagent transcript`
+            : showModelBadge
             ? `Open subagent transcript · running on ${modelBadge}`
             : 'Open subagent transcript'
         }
@@ -1317,14 +1237,14 @@ export function SubagentCard({
           {wait ? (
             <SubagentWaitNote wait={wait} modelBadge={showModelBadge ? modelBadge : undefined} />
           ) : (
-            <span key={activityKey} className={`subagent-card__activity${running ? ' shine' : ''}`}>
+            <span key={activityKey} className={`subagent-card__activity${running ? ' shine' : ''}`} title={activity}>
               {activity}
             </span>
           )}
         </span>
         <span className="subagent-card__trailing">
           {showModelBadge ? <span className="subagent-card__model">{modelBadge}</span> : null}
-          {items.length > 0 ? `${items.length} step${items.length === 1 ? '' : 's'}` : null}
+          {item.childItems?.length ? `${item.childItems.length} step${item.childItems.length === 1 ? '' : 's'}` : null}
         </span>
       </button>
       {modalOpen ? (
@@ -1411,11 +1331,24 @@ function SubagentModalFeed({
   onOpenFile?: (path: string) => void
 }): React.ReactElement {
   const scrollerRef = useRef<HTMLDivElement>(null)
+  const innerRef = useRef<HTMLDivElement>(null)
   const pinnedRef = useRef(true)
+  const pending = useAwaitingModel(items, streaming)
   useLayoutEffect(() => {
     const el = scrollerRef.current
     if (el && pinnedRef.current) el.scrollTop = el.scrollHeight
-  }, [items])
+  }, [items, pending])
+  // Timeline rows ease open between renders; stay pinned through that too.
+  useEffect(() => {
+    const el = scrollerRef.current
+    const inner = innerRef.current
+    if (!el || !inner || typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(() => {
+      if (pinnedRef.current) el.scrollTop = el.scrollHeight
+    })
+    observer.observe(inner)
+    return () => observer.disconnect()
+  }, [])
   const onScroll = (): void => {
     const el = scrollerRef.current
     if (!el) return
@@ -1423,70 +1356,36 @@ function SubagentModalFeed({
   }
   return (
     <div className="feed" ref={scrollerRef} onScroll={onScroll}>
-      <div className="feed__inner">
-        <TranscriptList items={items} streaming={streaming} onOpenFile={onOpenFile} />
+      <div className="feed__inner" ref={innerRef}>
+        <TranscriptList items={items} streaming={streaming} pending={pending} onOpenFile={onOpenFile} />
       </div>
     </div>
   )
 }
 
-/* ---- Activity group ------------------------------------------------
- * A run of consecutive tool calls AND interleaved thinking (no text output
- * between, no subagent feeds) renders as one cluster with three states:
- *  - live      : the turn is still working here — fixed-height box,
- *                auto-following the newest row (including streamed thinking),
- *                older rows fading out at the top edge
- *  - collapsed : the run moved on (final output arrived) — one human summary
- *                line ("Thought ×3, ran code ×2"); click to reopen
- *  - open      : user-expanded — full scrollable list; every row keeps its
- *                own input/output drill-down
- * A manual toggle always wins over the auto behavior. Thinking joins the
- * cluster because reasoning models interleave thought/tool/thought — boxing
- * only the tools would leave exactly those long-horizon turns unclustered.
+/* ---- Activity blocks -----------------------------------------------
+ * Consecutive tool calls and thinking (no prose between, no delegation
+ * cards) render as one ActivityBlock — see Activity.tsx. Prose that hasn't
+ * produced a word yet doesn't split a run. When the turn is running and
+ * nothing is progressing, the newest block ends in a Thinking row (after
+ * prose, a fresh block opens for it). Blocks retain their identity, so the
+ * step that ends a pause lands in the very block that showed the Thinking
+ * row, in the same slot. Identity follows the block's members across retry
+ * removals and history edits; position alone can remount unrelated activity.
  * ------------------------------------------------------------------- */
 
-/** A group member: a plain tool call, or one reasoning (thinking) part. */
-type ActivityItem = ToolItem | ReasoningItem
-
-/** Adjacent 'detailed' summary parts merged into one ReasoningRow. Memoized
- * on element identity: TranscriptList rebuilds the items array every frame
- * while streaming, and re-joining every finished entry's text per delta is
- * pure waste — the reducer preserves untouched item identity. */
-const MergedReasoning = memo(
-  function MergedReasoning({ items }: { items: ReasoningItem[] }): React.ReactElement | null {
-    const durations = items.map((r) => r.durationMs).filter((d): d is number => d !== undefined)
-    return (
-      <ReasoningRow
-        text={items.map((r) => r.text.trim()).filter(Boolean).join('\n\n')}
-        streaming={items[items.length - 1]!.streaming}
-        durationMs={durations.length > 0 ? durations.reduce((a, b) => a + b, 0) : undefined}
-      />
-    )
-  },
-  (prev, next) => sameItems(prev.items, next.items),
-)
-
-type GroupUnit = { kind: 'tool'; item: ToolItem } | { kind: 'thought'; items: ReasoningItem[] }
-
-/** Render units for a group's list: consecutive reasoning parts merge. */
-function groupUnits(items: ActivityItem[]): GroupUnit[] {
-  const units: GroupUnit[] = []
-  for (const it of items) {
-    const last = units[units.length - 1]
-    if (it.kind === 'reasoning') {
-      if (last?.kind === 'thought') last.items.push(it)
-      else units.push({ kind: 'thought', items: [it] })
-    } else {
-      units.push({ kind: 'tool', item: it })
-    }
-  }
-  return units
+/** A thought's full text, as markdown (summary parts arrive as bold headlines and lists). */
+function ThoughtMarkdown({ text }: { text: string }): React.ReactElement {
+  return <MarkdownBlock text={text} />
 }
+
+/** What the timeline renders inside rows; a module constant so rows stay memoized. */
+const ACTIVITY_RENDERERS: ActivityRenderers = { ToolBody, Markdown: ThoughtMarkdown }
 
 /**
  * Element-wise array equality. The grouping pass rebuilds entry arrays every
  * render, but the reducer preserves the identity of untouched items — so
- * comparing elements (not the array) lets groups/lists skip re-rendering when
+ * comparing elements (not the array) lets lists skip re-rendering when
  * nothing inside them changed.
  */
 function sameItems(a: readonly TranscriptItem[], b: readonly TranscriptItem[]): boolean {
@@ -1496,113 +1395,17 @@ function sameItems(a: readonly TranscriptItem[], b: readonly TranscriptItem[]): 
   return true
 }
 
-export const ToolGroup = memo(function ToolGroup({
-  items,
-  live,
-  onOpenFile,
-}: {
-  items: ActivityItem[]
-  /** The turn is still appending tool calls / thinking to this group. */
-  live: boolean
-  onOpenFile?: (path: string) => void
-}): React.ReactElement {
-  const [manual, setManual] = useState<boolean | null>(null)
-  const open = manual ?? live
-  const listRef = useRef<HTMLDivElement>(null)
-  const pinnedRef = useRef(true)
-  const [masked, setMasked] = useState(false)
-
-  // Streamed thinking grows a row WITHOUT adding items, so keying the follow
-  // effect on items.length alone would let the newest text drift below the
-  // fold mid-thought; fold reasoning text growth into the dependency.
-  const growth = items.reduce((n, it) => n + (it.kind === 'reasoning' ? it.text.length : 1), 0)
-
-  // Follow the newest row while live (unless the user scrolled up inside the
-  // box), and only fade the top edge once content actually overflows.
-  useLayoutEffect(() => {
-    const el = listRef.current
-    if (!el || !open) return
-    if (live && pinnedRef.current) el.scrollTop = el.scrollHeight
-    setMasked(live && el.scrollHeight > el.clientHeight)
-  }, [growth, live, open])
-
-  const onScroll = (): void => {
-    const el = listRef.current
-    if (!el) return
-    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 30
-  }
-
-  const working = items.some((it) => (it.kind === 'tool' ? it.status === 'running' : it.streaming))
-  const toolCount = items.filter((it) => it.kind === 'tool').length
-  const failed = items.filter((it) => it.kind === 'tool' && (it.status === 'error' || (it.status === 'done' && !!toolResultError(it.output)))).length
-  const summary = toolGroupSummary(items.map((it) => (it.kind === 'tool' ? it : { toolName: GROUP_THOUGHT })))
-
-  return (
-    <div className={`item tool-group${open ? ' tool-group--open' : ''}`}>
-      <button
-        className="tool-group__header"
-        onClick={() => setManual(!open)}
-        aria-expanded={open}
-        title={open ? 'Collapse the steps' : 'Show the steps'}
-      >
-        <span className={`tool-group__summary${working ? ' shine' : ''}`}>{summary}</span>
-        {failed > 0 ? <span className="tool-group__failed">{failed} failed</span> : null}
-        <span className="crow__trailing">
-          {working ? <Dots /> : <span className="tool-group__count">{toolCount} {toolCount === 1 ? 'tool call' : 'tool calls'}</span>}
-          <Chevron open={open} />
-        </span>
-      </button>
-      <div className={`tool-group__reveal${open ? '' : ' tool-group__reveal--closed'}`}>
-        <div className="tool-group__clip">
-          <div
-            className={`tool-group__list${live ? ' tool-group__list--live' : ''}${masked ? ' tool-group__list--masked' : ''}`}
-            ref={listRef}
-            onScroll={onScroll}
-          >
-            {groupUnits(items).map((u) =>
-              u.kind === 'tool' ? (
-                <ToolRow key={u.item.id} item={u.item} onOpenFile={onOpenFile} />
-              ) : (
-                <MergedReasoning key={u.items[0]!.id} items={u.items} />
-              ),
-            )}
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-},
-(prev, next) => prev.live === next.live && prev.onOpenFile === next.onOpenFile && sameItems(prev.items, next.items))
-
-/** Plain tool call that can join a group: delegations (subagent cards) never group. */
-function groupable(it: TranscriptItem): it is ToolItem {
-  return (
-    it.kind === 'tool' &&
-    it.toolName !== 'subagent_spawn' &&
-    it.toolName !== 'workflow_run' &&
-    it.childItems === undefined &&
-    it.childAgentId === undefined
-  )
-}
-
-type ReasoningItem = Extract<TranscriptItem, { kind: 'reasoning' }>
-
-type FeedEntry =
-  | { kind: 'single'; item: TranscriptItem }
-  | { kind: 'group'; items: ActivityItem[] }
-  | { kind: 'reasoning'; items: ReasoningItem[] }
+type FeedEntry = { kind: 'activity'; items: ActivityItem[] } | { kind: 'single'; item: TranscriptItem }
 
 /**
- * Transcript renderer with tool-call clustering: runs of 2+ consecutive
- * groupable tool calls become a ToolGroup; consecutive reasoning items (the
- * provider emits one per 'detailed' summary part) merge into a single
- * ReasoningRow at render time — durations summed, texts joined — without
- * touching the reducer or persisted items. Everything else renders as before.
- * Used by the main feed and by nested subagent feeds.
+ * Transcript renderer: runs of tool calls and thinking become activity
+ * blocks; everything else renders as its own item. Used by the main feed and
+ * by nested subagent feeds.
  */
 export const TranscriptList = memo(function TranscriptList({
   items,
   streaming,
+  pending,
   agentWaits,
   subagentModelBadge,
   onRevert,
@@ -1611,6 +1414,8 @@ export const TranscriptList = memo(function TranscriptList({
   items: TranscriptItem[]
   /** The owning turn (chat or subagent) is still running. */
   streaming?: boolean
+  /** The model is between steps: end the newest block with a Thinking row. */
+  pending?: boolean
   agentWaits?: AgentWaits
   /** Session model override label for running subagent cards (e.g. "Grok"). */
   subagentModelBadge?: string
@@ -1619,57 +1424,62 @@ export const TranscriptList = memo(function TranscriptList({
 }): React.ReactElement {
   const entries: FeedEntry[] = []
   for (const it of items) {
-    // Finished, empty, durationless reasoning renders nothing — keeping it in
-    // a run would inflate the box's step count with invisible rows.
+    // Finished, empty, durationless reasoning renders nothing, and prose
+    // without a word yet has nothing to show — neither may split a run.
     if (it.kind === 'reasoning' && !it.streaming && !it.durationMs && it.text.trim() === '') continue
+    if (it.kind === 'text' && it.text.trim() === '') continue
     const last = entries[entries.length - 1]
-    if (groupable(it)) {
-      if (last?.kind === 'group') last.items.push(it)
-      // Thinking that PRECEDED this tool call joins the same cluster: models
-      // interleave thought/tool/thought, and boxing only the tools would
-      // leave exactly those long-horizon runs unclustered in the feed.
-      else if (last?.kind === 'reasoning') entries[entries.length - 1] = { kind: 'group', items: [...last.items, it] }
-      else entries.push({ kind: 'group', items: [it] })
-    } else if (it.kind === 'reasoning') {
-      if (last?.kind === 'group') last.items.push(it)
-      else if (last?.kind === 'reasoning') last.items.push(it)
-      else entries.push({ kind: 'reasoning', items: [it] })
+    if (it.kind === 'reasoning' || isActivityTool(it)) {
+      if (last?.kind === 'activity') last.items.push(it)
+      else entries.push({ kind: 'activity', items: [it] })
     } else {
       entries.push({ kind: 'single', item: it })
     }
   }
-  const lastEntry = entries[entries.length - 1]
+  // The turn's newest entry. Steering typed but not yet delivered renders
+  // after it, so it never steals the Thinking row.
+  let newest = entries.length - 1
+  while (newest >= 0) {
+    const e = entries[newest]!
+    if (e.kind === 'single' && e.item.kind === 'user' && e.item.pending) newest--
+    else break
+  }
+  if (pending && entries[newest]?.kind !== 'activity') {
+    newest++
+    entries.splice(newest, 0, { kind: 'activity', items: [] })
+  }
+  const previousBlocks = useRef<ActivityIdentity[]>([])
+  let after: string | null = null
+  const blocks = reconcileActivityIdentity(previousBlocks.current, entries.flatMap(entry => {
+    if (entry.kind === 'single') {
+      after = entry.item.id
+      return []
+    }
+    return [{ ids: entry.items.map(item => item.id), after }]
+  }))
+  useLayoutEffect(() => { previousBlocks.current = blocks })
+  let blockIndex = 0
   return (
     <>
-      {entries.map((e) => {
-        if (e.kind === 'group') {
-          // Box only runs with 2+ TOOL calls. A single tool call — however
-          // much thinking surrounds it — stays inline: collapsing it would
-          // permanently hide the intent label ("Ran · parsing the syllabus"),
-          // the most informative line of a one-tool reasoning turn.
-          const toolCount = e.items.reduce((n, it) => n + (it.kind === 'tool' ? 1 : 0), 0)
-          if (toolCount >= 2) {
-            const live =
-              e.items.some((it) => (it.kind === 'tool' ? it.status === 'running' : it.streaming)) ||
-              (streaming === true && e === lastEntry)
-            return <ToolGroup key={`group-${e.items[0]!.id}`} items={e.items} live={live} onOpenFile={onOpenFile} />
-          }
+      {entries.map((e, index) => {
+        if (e.kind === 'activity') {
+          const isNewest = index === newest
+          const live = e.items.some(isActiveItem) || (streaming === true && isNewest)
+          // The same turn's next output closes the block's clock; a user
+          // message (or nothing yet) doesn't — that gap isn't the agent working.
+          const next = entries[index + 1]
+          const until = next?.kind === 'single' && (next.item.kind === 'text' || next.item.kind === 'tool') ? next.item.at : undefined
           return (
-            <Fragment key={`run-${e.items[0]!.id}`}>
-              {groupUnits(e.items).map((u) =>
-                u.kind === 'tool' ? (
-                  <ToolRow key={u.item.id} item={u.item} onOpenFile={onOpenFile} />
-                ) : (
-                  <MergedReasoning key={u.items[0]!.id} items={u.items} />
-                ),
-              )}
-            </Fragment>
+            <ActivityBlock
+              key={blocks[blockIndex++]!.key}
+              items={e.items}
+              until={until}
+              live={live}
+              pending={pending === true && isNewest}
+              renderers={ACTIVITY_RENDERERS}
+              onOpenFile={onOpenFile}
+            />
           )
-        }
-        if (e.kind === 'reasoning') {
-          // Only the last part can still be streaming; rebuilt strings are
-          // compared by value in ReasoningRow's memo, so no re-render churn.
-          return <MergedReasoning key={e.items[0]!.id} items={e.items} />
         }
         const item = e.item
         return (
@@ -1688,6 +1498,7 @@ export const TranscriptList = memo(function TranscriptList({
 },
 (prev, next) =>
   prev.streaming === next.streaming &&
+  prev.pending === next.pending &&
   prev.agentWaits === next.agentWaits &&
   prev.subagentModelBadge === next.subagentModelBadge &&
   prev.onRevert === next.onRevert &&
@@ -1701,34 +1512,55 @@ export const TranscriptList = memo(function TranscriptList({
  * the trailing block's text changes, so earlier blocks skip re-parsing.
  * ------------------------------------------------------------------- */
 
-const REMARK_PLUGINS = [remarkGfm]
-const REHYPE_PLUGINS = [rehypeHighlight]
-// Both arrays are module constants: building one per render would change
+const REMARK_PLUGINS = MARKDOWN_REMARK_PLUGINS
+const REMARK_PLUGINS_PREDICTIVE = [...REMARK_PLUGINS, remarkPredictiveMarkdown]
+// Label tables before KaTeX duplicates their text into HTML and MathML.
+const REHYPE_PLUGINS = [rehypeTableLabels, ...MARKDOWN_REHYPE_PLUGINS, rehypeHighlight]
+// Plugin arrays are module constants: building one per render would change
 // MarkdownBlock's props identity every delta and re-parse every block.
-const REHYPE_PLUGINS_REVEAL = [rehypeHighlight, rehypeMarkdownReveal]
-const MD_COMPONENTS: Components = { a: MarkdownLink, pre: MarkdownPre }
+const REHYPE_PLUGINS_REVEAL = [...REHYPE_PLUGINS, rehypeMarkdownReveal]
+const REHYPE_PLUGINS_REVEAL_CARET = [...REHYPE_PLUGINS_REVEAL, rehypeStreamCaret]
+function MarkdownTable({
+  children,
+  node: _node,
+  ...props
+}: React.TableHTMLAttributes<HTMLTableElement> & { node?: unknown }): React.ReactElement {
+  // `node` is react-markdown's hast node: spreading it would print
+  // node="[object Object]" onto the <table>.
+  return (
+    <div className="assistant-table-scroll" role="region" aria-label="Table" tabIndex={0}>
+      <table {...props}>{children}</table>
+    </div>
+  )
+}
+const MD_COMPONENTS: Components = { a: MarkdownLink, pre: MarkdownPre, table: MarkdownTable }
 
 // memo compares text + components — callers must pass an identity-stable
 // components object (or omit it) or streaming re-parses every block.
 //
-// `reveal` wraps each word in a fading span (see markdown-reveal.ts) and is
-// passed ONLY for the still-growing last block: earlier blocks are already
-// mounted and historical messages render with zero extra nodes. Dropping
-// `reveal` remounts the block once, which is invisible — the plain output is
-// the same text without the animation.
+// `reveal` wraps each word in a fading span (see markdown-reveal.ts). It stays
+// on for EVERY block while the message streams: a finished block keeps the
+// spans it was revealed with (memo holds it — neither prop changes), so no
+// block swaps spans for text mid-stream, which cut short the fade of its last
+// words. Historical messages render with zero extra nodes.
 const MarkdownBlock = memo(function MarkdownBlock({
   text,
   components = MD_COMPONENTS,
   reveal = false,
+  predictive = false,
+  caret = false,
 }: {
   text: string
   components?: Components
   reveal?: boolean
+  predictive?: boolean
+  /** End the text with the streaming caret (see markdown-caret.ts). */
+  caret?: boolean
 }): React.ReactElement {
   return (
     <ReactMarkdown
-      remarkPlugins={REMARK_PLUGINS}
-      rehypePlugins={reveal ? REHYPE_PLUGINS_REVEAL : REHYPE_PLUGINS}
+      remarkPlugins={predictive ? REMARK_PLUGINS_PREDICTIVE : REMARK_PLUGINS}
+      rehypePlugins={caret ? REHYPE_PLUGINS_REVEAL_CARET : reveal ? REHYPE_PLUGINS_REVEAL : REHYPE_PLUGINS}
       components={components}
     >
       {text}
@@ -1736,67 +1568,26 @@ const MarkdownBlock = memo(function MarkdownBlock({
   )
 })
 
-const LIST_LINE_RE = /^\s{0,3}(?:[-*+]|\d{1,9}[.)])\s/
-
-/**
- * Split markdown into independently renderable top-level blocks on blank
- * lines. Fence-aware (blank lines inside ``` fences don't split) and
- * list-aware (loose lists — blank lines between items/continuations — stay
- * one block so numbering and tightness render exactly as before).
- */
-function splitMarkdownBlocks(text: string): string[] {
-  const lines = text.split('\n')
-  const blocks: string[] = []
-  let cur: string[] = []
-  let inFence = false
-  let fenceChar = ''
-  let fenceLen = 0
-  const flush = (): void => {
-    if (cur.length > 0) {
-      blocks.push(cur.join('\n'))
-      cur = []
-    }
-  }
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]!
-    const fence = /^\s{0,3}(`{3,}|~{3,})/.exec(line)
-    if (fence) {
-      const marker = fence[1]!
-      if (!inFence) {
-        inFence = true
-        fenceChar = marker[0]!
-        fenceLen = marker.length
-      } else if (marker[0] === fenceChar && marker.length >= fenceLen) {
-        inFence = false
-      }
-      cur.push(line)
-      continue
-    }
-    if (!inFence && line.trim() === '') {
-      let j = i + 1
-      while (j < lines.length && lines[j]!.trim() === '') j++
-      const next = lines[j]
-      const prevLine = cur[cur.length - 1] ?? ''
-      const looseList =
-        next !== undefined &&
-        (LIST_LINE_RE.test(prevLine) || /^\s{2,}\S/.test(prevLine)) &&
-        (LIST_LINE_RE.test(next) || /^\s{2,}\S/.test(next))
-      if (looseList) {
-        cur.push(line)
-        continue
-      }
-      flush()
-      continue
-    }
-    cur.push(line)
-  }
-  flush()
-  return blocks
-}
-
 // No ItemActions here: copy/revert live on the user message only — showing
 // them on the answer too duplicated the affordance, and the hover strip's
 // reserved height read as a stray gap between the tool run and the text.
+/** A word's fade (.md-word in theme.css) plus a frame of slack. */
+const REVEAL_LINGER_MS = 360
+
+/** `value`, but a `true` → `false` edge waits `ms` before it lands. */
+function useLinger(value: boolean, ms: number): boolean {
+  const [held, setHeld] = useState(value)
+  useEffect(() => {
+    if (value) {
+      setHeld(true)
+      return
+    }
+    const timer = setTimeout(() => setHeld(false), ms)
+    return () => clearTimeout(timer)
+  }, [value, ms])
+  return value || held
+}
+
 export const AssistantMessage = memo(function AssistantMessage({
   text,
   streaming,
@@ -1818,6 +1609,7 @@ export const AssistantMessage = memo(function AssistantMessage({
               <MarkdownLink {...props} onOpenFile={onOpenFile} />
             ),
             pre: MarkdownPre,
+            table: MarkdownTable,
           }
         : MD_COMPONENTS,
     [onOpenFile],
@@ -1825,17 +1617,21 @@ export const AssistantMessage = memo(function AssistantMessage({
   // Embeds mount once the reply is complete: a half-streamed link would flash
   // a viewer for a file that may still be being written.
   const artifacts = useMemo(() => (streaming ? [] : extractArtifactLinks(text)), [text, streaming])
+  // Word spans outlive the stream by one fade, so the last words land
+  // instead of snapping to full opacity when the spans are dropped.
+  const revealing = useLinger(streaming, REVEAL_LINGER_MS)
   return (
-    <div className="item assistant">
+    <div className={`item assistant${revealing ? ' assistant--streaming' : ''}`}>
       {blocks.map((block, i) => (
         <MarkdownBlock
           key={i}
           text={block}
           components={components}
-          reveal={streaming && i === blocks.length - 1}
+          reveal={revealing}
+          predictive={streaming && i === blocks.length - 1}
+          caret={streaming && i === blocks.length - 1}
         />
       ))}
-      {streaming ? <span className="assistant__caret" aria-hidden="true" /> : null}
       {artifacts.length > 0 ? (
         <div className="artifact-embeds">
           {artifacts.map((path) => (
@@ -1994,7 +1790,7 @@ export const TranscriptItemView = memo(function TranscriptItemView({
         />
       )
     case 'reasoning':
-      return <ReasoningRow text={item.text} streaming={item.streaming} durationMs={item.durationMs} />
+      return <ActivityBlock items={[item]} live={item.streaming} pending={false} renderers={ACTIVITY_RENDERERS} onOpenFile={onOpenFile} />
     case 'tool':
       return (
         <ToolRow

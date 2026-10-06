@@ -1,0 +1,396 @@
+/* ------------------------------------------------------------------ *
+ * Activity timeline (components/Activity.tsx).
+ *
+ * One quiet column: a 16px icon slot, then the label, then a dimmer detail
+ * that truncates first. Nothing in a run uses primary text — that tier
+ * belongs to the prose and the user's message. Timing and disclosure show
+ * on hover only. A faint rail links each icon to the next; it's drawn inside
+ * each row's own box (above and below its icon) so height animations can
+ * clip rows without cutting the rail.
+ *
+ * Geometry: head = 4px padding + 18px line → 26px; the 14px icon is centred
+ * on the first line, so it spans y 6–20 and the rail keeps a 3px gap each side.
+ * ------------------------------------------------------------------ */
+
+.activity {
+  --step-icon: 16px;
+  --step-gap: 8px;
+  --step-indent: calc(var(--step-icon) + var(--step-gap));
+  /* Live window: five rows and a sliver of the sixth under the fade. */
+  --activity-cap: 142px;
+  --rail: rgb(var(--fg) / 0.1);
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* Prose needs room to read while the agent works; tool-only runs keep their
+   compact five-row window. Explicitly opened activity has no viewport cap. */
+.activity--reasoning-preview {
+  --activity-cap: 300px;
+}
+
+/* Same seam rule the old tool rows had: header padding + the feed gap
+   already separate a run from the answer under it. */
+.activity + .assistant {
+  margin-top: 0;
+}
+
+/* ---- header: "Working for 12s" → "Worked for 42s" ---------------- */
+
+.activity__head {
+  overflow: hidden;
+}
+.activity__header {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 4px 0;
+  color: var(--text-tertiary);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  text-align: left;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+.activity__header:hover,
+.activity__header--open {
+  color: var(--text-secondary);
+}
+.activity__header:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: var(--r-sm);
+}
+.activity__summary {
+  min-width: 0;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.activity__header .step-chevron {
+  flex: 0 0 auto;
+  color: var(--text-quaternary);
+  transition: transform 160ms var(--ease-out), color var(--dur-fast) var(--ease-out);
+}
+.activity__header:hover .step-chevron {
+  color: var(--text-tertiary);
+}
+.activity__header--open .step-chevron {
+  transform: rotate(90deg);
+}
+.activity__failed {
+  flex: 0 0 auto;
+  margin-left: 2px;
+  font-size: var(--fs-small);
+  color: color-mix(in srgb, var(--danger) 78%, transparent);
+}
+
+/* ---- body + live window ------------------------------------------ */
+
+.activity__body {
+  overflow: hidden;
+}
+
+/* Bottom-anchored: column-reverse keeps the newest row in view as rows grow
+   in underneath, with no scroll bookkeeping; older rows slide up under a
+   fade and can still be scrolled back to. */
+.activity__viewport--capped {
+  display: flex;
+  flex-direction: column-reverse;
+  max-height: var(--activity-cap);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+.activity__viewport--capped::-webkit-scrollbar {
+  display: none;
+}
+.activity__viewport--masked {
+  mask-image: linear-gradient(to bottom, transparent 0, #000 40px);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 40px);
+}
+
+.activity__track {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* ---- rows --------------------------------------------------------- */
+
+.step {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* The rail: a segment above this row's icon and one below it (down through
+   an open body), so consecutive rows join into one line. */
+.step::before,
+.step::after {
+  content: '';
+  position: absolute;
+  left: calc(var(--step-icon) / 2 - 0.5px);
+  width: 1px;
+  background: var(--rail);
+  pointer-events: none;
+}
+.step::before {
+  top: 0;
+  height: 3px;
+}
+.step::after {
+  top: 23px;
+  bottom: 0;
+}
+.activity__track > .step:first-child::before,
+.step__children > .step:first-child::before,
+.activity__track > .step:last-child::after,
+.step__children > .step:last-child::after {
+  display: none;
+}
+
+.step__head {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--step-gap);
+  width: 100%;
+  min-width: 0;
+  padding: 4px 0;
+  color: var(--text-secondary);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  text-align: left;
+}
+/* Every row head is a <button> (see Head in Activity.tsx); one with nothing
+   behind it is disabled and must look exactly like plain text. */
+.step__head:disabled {
+  cursor: default;
+}
+.step__head:not(:disabled) {
+  cursor: pointer;
+}
+.step__head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: var(--r-sm);
+}
+
+.step__icon {
+  position: relative;
+  flex: 0 0 var(--step-icon);
+  height: var(--lh-body);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+}
+.step__glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.step__text {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: var(--lh-body);
+  overflow: hidden;
+}
+/* The line (label + detail) is what crossfades — see Swap in Activity.tsx. */
+.step__line {
+  display: block;
+  min-width: 0;
+}
+/* One line, always. The label takes its natural width; the detail takes what
+   is left — and when less than 64px is left it wraps onto a second line that
+   this fixed height hides, so a detail shows whole-ish or not at all (never
+   a stray "“Ga…"), and never costs the label a pixel. (Shrink weights can't
+   do this: any shrink at all puts an ellipsis on the label.) */
+.step__line > .swap__item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 8px;
+  height: var(--lh-body);
+  overflow: hidden;
+}
+.step__label {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+.step__detail {
+  flex: 1 1 0;
+  min-width: min(64px, 100%);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--text-tertiary);
+  font-size: var(--fs-small);
+}
+.step__detail--mono {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  letter-spacing: -0.01em;
+}
+.step__detail--error {
+  color: color-mix(in srgb, var(--danger) 72%, var(--text-tertiary));
+}
+/* A detail that arrives after its row (targets parsed from streaming code). */
+.step__detail--late {
+  animation: fade-in 160ms var(--ease-smooth) both;
+}
+
+/* A busy step's running time: in flow, since it's live information. */
+.step__elapsed {
+  flex: 0 0 auto;
+  color: var(--text-tertiary);
+  font-size: var(--fs-small);
+  font-variant-numeric: tabular-nums;
+}
+/* Timing and disclosure are there when you reach for them: an overlay at the
+   row's end that costs the text column nothing at rest, fading the text out
+   under it rather than reflowing it. */
+.step__meta {
+  position: absolute;
+  top: 4px;
+  right: 0;
+  height: var(--lh-body);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 24px;
+  background: linear-gradient(to right, transparent, var(--bg-content) 18px);
+  color: var(--text-quaternary);
+  font-size: var(--fs-small);
+  font-variant-numeric: tabular-nums;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--dur-normal) var(--ease-out);
+}
+.step__head:not(:disabled):hover > .step__meta,
+.step__head:focus-visible > .step__meta,
+.step--open > .step__head > .step__meta {
+  opacity: 1;
+}
+.step__meta .step-chevron {
+  transition: transform 160ms var(--ease-out);
+}
+.step--open > .step__head .step-chevron {
+  transform: rotate(90deg);
+}
+.step__head:not(:disabled):hover .step__label {
+  color: var(--text-primary);
+}
+
+/* ---- states -------------------------------------------------------- */
+
+.step--drafting > .step__head .step__icon,
+.step--running > .step__head .step__icon,
+.step--pending .step__icon {
+  color: var(--text-secondary);
+}
+.step--pending .step__label {
+  color: var(--text-tertiary);
+}
+.step--error > .step__head .step__icon {
+  color: var(--danger);
+}
+
+/* Breathing ring: something is in progress — a pause, streamed arguments,
+   thinking, a running tool. Keyframes start and end on the same values, and
+   phase-lock.ts keeps every ring on one clock, so the loop never jumps. */
+.step__pulse {
+  width: 9px;
+  height: 9px;
+  border-radius: var(--r-full);
+  border: 1.3px solid currentColor;
+  animation: step-breathe 1.6s var(--ease-smooth) infinite;
+  will-change: transform, opacity;
+}
+@keyframes step-breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.86);
+  }
+  50% {
+    opacity: 0.95;
+    transform: scale(1);
+  }
+}
+
+.step-glyph {
+  display: block;
+}
+
+/* ---- crossfading labels -------------------------------------------- */
+
+.swap {
+  position: relative;
+}
+/* A block (or the line's flex box), never an inline span: AnimatePresence's
+   popLayout measures the exiting item with getComputedStyle(), and an inline
+   element's width and height read "auto" — motion then silently skips the
+   pop, so the old text stayed in flow and the two sat side by side
+   ("ThinkingLocating…") for the length of the fade. */
+.swap__item {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.swap__ghost {
+  position: absolute;
+  left: 0;
+  top: 0;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* ---- bodies -------------------------------------------------------- */
+
+.step__body {
+  overflow: hidden;
+}
+/* ToolBody's own wrapper: indent to the label column; motion owns the
+   entrance, so its CSS keyframe would only double it. */
+.step__body > .crow__body {
+  padding: 2px 0 8px var(--step-indent);
+  animation: none;
+}
+.step__children {
+  display: flex;
+  flex-direction: column;
+  padding: 0 0 2px var(--step-indent);
+}
+.step__thought {
+  padding: 2px 0 8px var(--step-indent);
+  font-size: var(--fs-small);
+  line-height: var(--lh-small);
+}
+
+/* Automatically opened prose stays scrollable without taking over the feed.
+   A summary the reader opens manually uses its full natural height. */
+.step__thought--preview {
+  max-height: 240px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .step__pulse {
+    animation: none;
+  }
+  .step__pulse {
+    opacity: 0.7;
+  }
+}

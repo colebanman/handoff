@@ -8,3 +8,4 @@
 
 /** True only in `npm run build:dev` (HANDOFF_DEV=1). */
 declare const __DEV_BUILD__: boolean
+declare const __HARNESS_VERSION__: string

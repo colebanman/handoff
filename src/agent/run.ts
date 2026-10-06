@@ -16,13 +16,15 @@ import { formatError } from '../shared/errors'
 import { toolResultError } from '../shared/tool-results'
 import { abortable, throwIfAborted } from '../shared/abort'
 import { sanitizeModelMessages } from '../shared/model-messages'
+import { browserContextMetadata, getBrowserContextTab, withoutBrowserContextMetadata } from '../shared/browser-context'
 import { publishTap, summarizeTapPart, tapEnabled } from '../shared/stream-tap'
 import { resolveModel, resolveModelAccess } from './models'
 import { OpenAICompaction, withoutCompaction } from './compaction'
 import { openAIContextWindow } from '../shared/model-context'
-import { listChatGPTModels } from './openai-chatgpt-oauth'
+import { requestContextUsage } from '../shared/context-usage'
+import { resolveContextWindow } from './model-context'
 import { withModelIdleTimeout } from './model-idle-timeout'
-import { withRateLimitRetry, type MainAgentPriority, type RateLimitHooks } from './rate-limit'
+import { isOffline, isRetryableTransportError, waitForConnection, withRateLimitRetry, type MainAgentPriority, type RateLimitHooks } from './rate-limit'
 import {
   buildSystemMessages,
   cacheRequestOptions,
@@ -31,14 +33,11 @@ import {
 } from './prompt-cache'
 import { inlineMediaToolResults, supportsMediaToolResults } from './tool-result-media'
 import { pruneReplayedHistory } from './history-pruning'
+import { preserveAnthropicHistory } from './anthropic-history'
 import { compressBrowserSnapshots, latestBrowserSnapshotContext } from './browser-snapshot-context'
 import { buildSystemPrompt } from './system-prompt'
-import { RuntimeContextDelivery, latestTaskText, selectSiteMemories, type ContextTab } from './runtime-context'
-import { readMemory, serializeMemoryForPrompt } from './memory'
-import { readSiteMemory } from './site-memory'
-import { createTypeSafe } from './typesafe'
-import { chooseSavedShortcut } from './typesafe-shortcut'
-import type { ExtensionSummary } from '../shared/extensions'
+import { RuntimeContextDelivery, type ContextTab } from './runtime-context'
+import { memoryRuntime, withoutRememberedContext } from './continuity-context'
 import { buildTools, ToolOperationTracker, type AgentContext, type MessageSubagentFn, type RunWorkflowFn, type SpawnSubagentFn, type TaskAccess } from './tools'
 import type { CdpService, SandboxService, VirtualFileSystemService } from '../shared/types'
 import type { AgentTabGroups } from './tab-groups'
@@ -126,14 +125,14 @@ export interface RunLoopResult {
 const MIN_THROUGHPUT_SAMPLE_MS = 250
 
 function toUsage(
-  u: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cachedInputTokens?: number } | undefined,
+  u: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cachedInputTokens?: number; inputTokenDetails?: { cacheReadTokens?: number } } | undefined,
 ): Usage | undefined {
   if (!u) return undefined
   return {
     inputTokens: u.inputTokens,
     outputTokens: u.outputTokens,
     totalTokens: u.totalTokens,
-    cachedInputTokens: u.cachedInputTokens,
+    cachedInputTokens: u.inputTokenDetails?.cacheReadTokens ?? u.cachedInputTokens,
   }
 }
 
@@ -197,6 +196,10 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
         if (!isSubagent) priority?.clearWaiting(runKey)
         emit({ type: 'rate-limit-clear', agentId: ctx.agentId })
       },
+      onConnectionWait: ({ attempt, delayMs, message, offline }) =>
+        emit({ type: 'rate-limit', agentId: ctx.agentId, attempt, retryInMs: delayMs,
+          message, kind: 'connection', offline }),
+      onConnectionClear: () => emit({ type: 'rate-limit-clear', agentId: ctx.agentId }),
       beforeAttempt:
         isSubagent && priority
           ? async () => {
@@ -224,9 +227,9 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
     }
 
     const observedTabIds = new Set<number>()
-    const typeSafe = createTypeSafe(settings, signal)
+    let observation = 0
+    const tabObservations = new Map<number, { sequence: number; at: number; url?: string; bound?: number }>()
     const tools: ToolSet = buildTools({
-      typeSafe,
       cdp: deps.cdp,
       sandbox: deps.sandbox,
       vfs: deps.vfs,
@@ -245,7 +248,7 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
       maxToolOutputChars: toolOutputLimitForModel(activeModelId),
       askUser: opts.askUser,
       operationTracker,
-      onTabObserved: (tabId) => observedTabIds.add(tabId),
+      onTabObserved: (tabId) => { observedTabIds.add(tabId); tabObservations.set(tabId, { sequence: ++observation, at: Date.now() }) },
     })
 
     // Original turn/spawn messages — responseMessages returned at the end are
@@ -262,14 +265,15 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
     // is undefined for every hosted model, which leaves their replay unbounded
     // and their cached prefixes byte-identical to before.
     const sanitized = sanitizeModelMessages(messages) as ModelMessage[]
-    const prunedHistory = pruneReplayedHistory(sanitized, {
+    const preserveHistory = preserveAnthropicHistory(activeModelId, sanitized)
+    const prunedHistory = preserveHistory ? undefined : pruneReplayedHistory(sanitized, {
       snapshotBudgetChars: snapshotBudgetForModel(activeModelId),
     })
-    if (
+    if (prunedHistory && (
       prunedHistory.stubbedSnapshots > 0 ||
       prunedHistory.trimmedOutputs > 0 ||
       prunedHistory.prunedMedia > 0
-    ) {
+    )) {
       debugLog.log('agent', 'history pruned', {
         agentId: ctx.agentId,
         stubbedSnapshots: prunedHistory.stubbedSnapshots,
@@ -280,12 +284,12 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
         charsSaved: prunedHistory.charsSaved,
       })
     }
-    const originalRequest = prunedHistory.messages
+    const originalRequest = prunedHistory?.messages ?? sanitized
     // Pruning is a request projection, never a storage update. Restore the
     // original prefix when checkpointing a run (including subagent resumes).
     const canonicalHistory = (history: ModelMessage[]): ModelMessage[] =>
       [...sanitized, ...history.slice(sanitized.length)]
-    let runtimeContext = new RuntimeContextDelivery(sanitized, typeSafe)
+    let runtimeContext = new RuntimeContextDelivery(sanitized)
     // Initial messages for the current streamText attempt; advanced to the
     // last completed-step snapshot when we restart on a new model.
     let streamMessages = originalRequest
@@ -342,52 +346,9 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
     let finalUsage: Usage | undefined
     let finalFinishReason: string | undefined
 
-    // Attempt once per fresh main-agent turn. Execute through the ordinary tool
-    // wrapper so scope, cancellation, activity, output spilling and UI stay intact.
-    if (typeSafe && !isSubagent && !ctx.offlineOnly && deps.vfs.extensions && !opts.steering?.peek?.()) {
-      let shortcut
-      try {
-        const [entries, tabs, memory, sites] = await Promise.all([
-          deps.vfs.extensions('list') as Promise<ExtensionSummary[]>, chrome.tabs.query({}),
-          readMemory(deps.vfs), readSiteMemory(deps.vfs),
-        ])
-        const constraints = JSON.stringify({ standingInstructions: settings.customInstructions,
-          userMemory: serializeMemoryForPrompt(memory),
-          siteGuidance: selectSiteMemories(sites, latestTaskText(sanitized), tabs, { isSubagent: false, currentTabId: ctx.currentTabId }),
-        })
-        shortcut = await chooseSavedShortcut(typeSafe, entries, tabs, sanitized, constraints)
-        if (shortcut) {
-          const fresh = await deps.vfs.extensions('list') as ExtensionSummary[]
-          if (!fresh.some((e) => e.id === shortcut!.id && e.enabled && e.revision === shortcut!.revision)) shortcut = undefined
-        }
-      } catch {
-        throwIfAborted(signal)
-        debugLog.log('agent', 'TypeSafe shortcut unavailable; using agent')
-      }
-      throwIfAborted(signal)
-      if (shortcut && !opts.steering?.peek?.()) {
-        const toolCallId = uid('shortcut')
-        const input = { intent: shortcut.intent, code: shortcut.code }
-        ctx.extensionRevisions = { ...ctx.extensionRevisions, [shortcut.id]: shortcut.revision }
-        emit({ type: 'tool-call', agentId: ctx.agentId, toolCallId, toolName: 'sandbox_exec', input })
-        const started = Date.now()
-        const output = await tools.sandbox_exec!.execute!(input, { toolCallId, messages: sanitized, abortSignal: signal })
-        throwIfAborted(signal)
-        const text = String(output)
-        emit({ type: 'tool-result', agentId: ctx.agentId, toolCallId, toolName: 'sandbox_exec', output: text,
-          durationMs: Date.now() - started, isError: !!toolResultError(text) })
-        const completed: ModelMessage[] = [
-          { role: 'assistant', content: [{ type: 'tool-call', toolCallId, toolName: 'sandbox_exec', input }] },
-          { role: 'tool', content: [{ type: 'tool-result', toolCallId, toolName: 'sandbox_exec', output: { type: 'text', value: text } }] },
-        ]
-        streamMessages = [...originalRequest, ...completed]
-        fullConversation = [...sanitized, ...completed]
-        opts.onStepMessages?.(fullConversation)
-      }
-    }
-
     // Restart streamText when the model switches mid-task (rate-limit banner
     // or step boundary). Each attempt keeps conversation context.
+    let connectionRestarts = 0
     while (true) {
       const desired = resolveDesiredModelId(activeModelId, isSubagent, opts.getModelOverride?.())
       if (desired !== activeModelId) {
@@ -411,20 +372,19 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
         emit({ type: 'model-switch', agentId: ctx.agentId, modelId: activeModelId, previousModelId })
       }
       const authMode = effective.provider === 'openai' ? effective.openaiAuthMode : undefined
-      let contextWindow = openAIContextWindow(effective.modelId, authMode)
-      if (access.chatgptCredentials) {
-        try {
-          contextWindow = (await listChatGPTModels(false, signal)).find((model) => model.id === effective.modelId.replace(/^openai\//, ''))?.contextWindow ?? contextWindow
-        } catch { throwIfAborted(signal) /* The fallback still leaves ample headroom. */ }
-      }
+      const contextWindow = await resolveContextWindow(effective, signal)
       let browserContext: string | undefined
       const compaction = (effective.provider === 'openai' || (effective.provider === 'gateway' && effective.modelId.startsWith('openai/'))) ? new OpenAICompaction({
         modelId: effective.modelId,
-        contextWindow,
+        contextWindow: contextWindow?.tokens ?? openAIContextWindow(effective.modelId, authMode),
         agentId: ctx.agentId, signal, emit,
-        scope: `${effective.provider}:${authMode ?? 'api-key'}:${access.chatgptCredentials?.accountId ?? ''}`,
+        get scope() {
+          const memory = memoryRuntime()
+          return `${effective.provider}:${authMode ?? 'api-key'}:${access.chatgptCredentials?.accountId ?? ''}${memory ? `:memory-${memory.snapshot()?.state.privacyVersion ?? 'loading'}` : ''}`
+        },
         serverSide: authMode === 'chatgpt',
         browserContext: () => browserContext,
+        compactionInput: memoryRuntime() ? withoutRememberedContext : undefined,
       }) : undefined
       const resolvedModel = resolveModel(effective, access.chatgptCredentials, compaction?.wrapFetch.bind(compaction))
       // Main-agent requests can stall after tool completion too. Keep the
@@ -447,7 +407,6 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
           offlineOnly: ctx.offlineOnly,
           task: opts.task,
           customInstructions: settings.customInstructions,
-          typeSafe: !!typeSafe,
         }),
         cacheBreakpoints,
       )
@@ -471,6 +430,11 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
       // Ambient pointer: breathe on the agent's tabs while this attempt
       // streams. Tools pause it themselves via ToolOperationTracker.
       const endModelTurn = deps.cdp.beginModelTurn?.(signal)
+      let stepCalledTools = false
+      let stepSubmittedTool = false
+      let stepToolCount = operationTracker.startedCount
+      const currentPartIds = new Set<string>()
+      const preparingToolIds = new Set<string>()
       try {
         const result = streamText({
           model,
@@ -493,10 +457,16 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
           providerOptions: cache.providerOptions,
           headers: cache.headers,
           prepareStep: async ({ messages: stepMessages }) => {
+            stepToolCount = operationTracker.startedCount
             for (const raw of opts.steering?.take() ?? []) {
-              const text = raw.trim()
+              const text = (typeof raw === 'string' ? raw : raw.text).trim()
               if (!text) continue
-              injected.push({ index: stepMessages.length, message: { role: 'user', content: text } })
+              const browserContext = typeof raw === 'string' ? undefined : raw.browserContext
+              injected.push({ index: stepMessages.length, message: { role: 'user',
+                content: browserContext?.text ? `${text}\n\n${browserContext.text.replace('</context>',
+                  `Browser tools still default to working tab ${ctx.currentTabId}. Pass tabId explicitly when switching to the attached active page.\n</context>`)}` : text,
+                ...(browserContext ? browserContextMetadata(browserContext.tabId) : {}),
+              } })
               emit({ type: 'steering', agentId: ctx.agentId, text })
               debugLog.log('agent', 'steering attached', { agentId: ctx.agentId })
             }
@@ -518,10 +488,20 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
               if (!ctx.offlineOnly) {
                 try { tabs = await chrome.tabs.query({}) } catch { /* Explicit task URLs still route guides. */ }
               }
+              if (!tabObservations.size && ctx.currentTabId) tabObservations.set(ctx.currentTabId, { sequence: 0, at: Date.now() })
+              for (const [id, observed] of tabObservations) {
+                if (observed.bound !== observed.sequence) {
+                  observed.url = tabs.find((t) => t.id === id)?.url
+                  observed.bound = observed.sequence
+                }
+              }
+              const memoryUrls = [...tabObservations].filter(([id, seen]) => seen.url && tabs.some((t) => t.id === id && t.url === seen.url) &&
+                (id === ctx.currentTabId || Date.now() - seen.at < 120_000)).sort((a, b) => b[1].sequence - a[1].sequence).slice(0, 4).map(([, seen]) => seen.url!)
               const update = await runtimeContext.next(deps.vfs, history, tabs, {
                 isSubagent, currentTabId: ctx.currentTabId, observedTabIds: [...observedTabIds],
                 allowedTabIds: ctx.allowedTabIds, offlineOnly: ctx.offlineOnly, task: opts.task, chatId: opts.chatId,
                 pendingTasks: !isSubagent && opts.chatId ? opts.tasks.list?.().filter((task) => task.chatId === opts.chatId) : [],
+                modelId: activeModelId, memoryUrls,
               })
               ctx.extensionRevisions = runtimeContext.extensionRevisions
               if (signal.aborted) throw signal.reason ?? new Error('Turn stopped')
@@ -559,6 +539,7 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
             // responseMessages.
             browserContext = latestBrowserSnapshotContext(merged)
             if (inlineMedia) merged = inlineMediaToolResults(merged)
+            merged = runtimeContext.projectMemory(merged)
             merged = compaction ? compaction.prepare(merged, async (message) => {
               injected.push({ index: stepMessages.length, message })
               // Standalone compaction resumes inference in this same fetch,
@@ -569,12 +550,20 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
               opts.onStepMessages?.(fullConversation)
               return update
             }) : withoutCompaction(merged)
-            merged = runtimeContext.restoreExtensions(merged)
-            merged = compressBrowserSnapshots(merged)
+            // RuntimeContextDelivery.next already appends updated inventories.
+            // Removing their old versions invalidates Claude's signed prefix.
+            if (!preserveAnthropicHistory(effective.modelId, merged)) merged = runtimeContext.restoreExtensions(merged)
+            merged = withoutBrowserContextMetadata(compressBrowserSnapshots(merged))
             if (cacheBreakpoints) return { messages: withCacheBreakpoints(merged) }
             return merged !== stepMessages ? { messages: merged } : undefined
           },
           onStepFinish: (step) => {
+            const transformations = step.providerMetadata?.anthropic?.inputTransformations
+            if (Array.isArray(transformations)) {
+              const dropped = transformations.filter((entry) => entry && typeof entry === 'object' &&
+                'reason' in entry && entry.reason === 'prefix_binding_mismatch').length
+              if (dropped) debugLog.log('agent', 'Claude thinking prefix changed', { agentId: ctx.agentId, dropped })
+            }
             compaction?.observeUsage(toUsage(step.usage) ?? {})
             const compacted = compaction?.takeCheckpoint()
             if (compacted) {
@@ -630,7 +619,6 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
         let textFirstMs: number | undefined
         let textLastMs: number | undefined
         let textChars = 0
-        let stepCalledTools = false
 
         // Text/reasoning part ids are only unique per response for providers on
         // the Responses API. The OpenAI chat-completions transport hardcodes
@@ -667,6 +655,7 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
           }
           switch (part.type) {
             case 'text-start':
+              currentPartIds.add(scopedId(part.id))
               emit({ type: 'text-start', agentId: ctx.agentId, id: scopedId(part.id), at: Date.now() })
               break
             case 'text-delta': {
@@ -682,6 +671,7 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
               break
 
             case 'reasoning-start':
+              currentPartIds.add(scopedId(part.id))
               startTimes.set(scopedId(part.id), Date.now())
               emit({ type: 'reasoning-start', agentId: ctx.agentId, id: scopedId(part.id) })
               break
@@ -699,6 +689,7 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
 
             case 'tool-input-start':
               stepCalledTools = true
+              preparingToolIds.add(part.id)
               // `id` here IS the toolCallId (per ai-sdk-v6 doc).
               emit({
                 type: 'tool-input-start',
@@ -722,6 +713,8 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
 
             case 'tool-call': {
               stepCalledTools = true
+              stepSubmittedTool = true
+              preparingToolIds.delete(part.toolCallId)
               startTimes.set(part.toolCallId, Date.now())
               const input = part.input && typeof part.input === 'object' ? part.input as Record<string, unknown> : undefined
               const target = part.toolName === 'browser_click' && typeof input?.ref === 'string'
@@ -734,6 +727,7 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
                 toolCallId: part.toolCallId,
                 toolName: part.toolName,
                 input: target ? { ...input, __target: target } : part.input,
+                executionId: partScope,
               })
               debugLog.log('agent', 'tool-call', {
                 agentId: ctx.agentId,
@@ -746,6 +740,7 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
             }
             case 'tool-result': {
               const error = toolResultError(part.output)
+              if (opts.chatId) void memoryRuntime()?.captureTool?.(opts.chatId, { id: part.toolCallId, executionId: partScope, agentId: ctx.agentId, toolName: part.toolName, input: part.input, output: part.output, failed: !!error }).catch((err) => debugLog.error('agent', 'capture tool evidence', err))
               emit({
                 type: 'tool-result',
                 agentId: ctx.agentId,
@@ -759,10 +754,12 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
                 agentId: ctx.agentId,
                 toolName: part.toolName,
                 toolCallId: part.toolCallId,
+                ...(error ? { isError: true, error: error.message } : {}),
               })
               break
             }
             case 'tool-error':
+              if (opts.chatId) void memoryRuntime()?.captureTool?.(opts.chatId, { id: part.toolCallId, executionId: partScope, agentId: ctx.agentId, toolName: part.toolName, input: part.input, output: formatError(part.error), failed: true }).catch((err) => debugLog.error('agent', 'capture tool evidence', err))
               emit({
                 type: 'tool-result',
                 agentId: ctx.agentId,
@@ -782,9 +779,13 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
               textLastMs = undefined
               textChars = 0
               stepCalledTools = false
+              stepSubmittedTool = false
+              currentPartIds.clear()
+              preparingToolIds.clear()
               partScope = crypto.randomUUID()
               break
             case 'finish-step': {
+              connectionRestarts = 0
               attemptSteps += 1
               stepCount = stepsBeforeAttempt + attemptSteps
               // Tokens/sec for the answer text alone.
@@ -806,6 +807,8 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
                 agentId: ctx.agentId,
                 modelId: activeModelId,
                 usage: toUsage(part.usage) ?? {},
+                context: requestContextUsage(effective, contextWindow, part.usage,
+                  effective.provider === 'openai' ? { ...effective, openaiAuthMode: settings.openaiAuthMode } : effective),
               })
               break
             }
@@ -825,6 +828,7 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
                 // / rate-limit middleware inside the stream. Restart outside.
                 throw part.error
               }
+              if (isRetryableTransportError(part.error)) throw part.error
               emittedError = true
               streamErrorText ??= formatError(part.error)
               emit({
@@ -865,6 +869,35 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
 
         break // stream completed successfully
       } catch (err) {
+        // A dropped stream cannot be resumed byte-for-byte. Re-run only the
+        // current model step from the last completed-step checkpoint.
+        // Streaming arguments has no side effects. Submitted calls or tools
+        // already started by the SDK prohibit retry, including fast tools that
+        // settled before their tool-call event reached this consumer.
+        const retryLimit = err instanceof Error && err.name === 'ModelIdleTimeoutError' ? 1 : 3
+        if (!signal.aborted && isRetryableTransportError(err) && !stepSubmittedTool &&
+          operationTracker.startedCount === stepToolCount &&
+          (currentPartIds.size > 0 || preparingToolIds.size > 0) && connectionRestarts < retryLimit) {
+          connectionRestarts += 1
+          emit({ type: 'connection-restart', agentId: ctx.agentId, partIds: [...currentPartIds], toolCallIds: [...preparingToolIds] })
+          streamMessages = fullConversation
+          injected.length = 0
+          runtimeContext = new RuntimeContextDelivery(streamMessages)
+          const delayMs = Math.min(1000 * 2 ** (connectionRestarts - 1), 8000)
+          emit({ type: 'rate-limit', agentId: ctx.agentId, attempt: connectionRestarts,
+            retryInMs: delayMs, kind: 'connection', offline: isOffline(),
+            message: preparingToolIds.size > 0
+              ? 'Model stopped while preparing an action. Retrying before execution.'
+              : 'Connection lost while streaming. Restarting the current response.' })
+          try {
+            await waitForConnection(delayMs, signal, undefined, () => emit({ type: 'rate-limit',
+              agentId: ctx.agentId, attempt: connectionRestarts, retryInMs: 0,
+              kind: 'connection', offline: true, message: 'Waiting for internet connection.' }))
+          } finally {
+            emit({ type: 'rate-limit-clear', agentId: ctx.agentId })
+          }
+          continue
+        }
         if (isAgentLoopRestart(err) && !signal.aborted) {
           // Prefer the last completed-step snapshot; if we were rate-limited
           // before any generation this step, fullConversation/streamMessages
@@ -875,7 +908,7 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
           injected.length = 0
           // A provider switch can abandon a prepared request before its first
           // completed step. Rehydrate only what survived into replay history.
-          runtimeContext = new RuntimeContextDelivery(streamMessages, typeSafe)
+          runtimeContext = new RuntimeContextDelivery(streamMessages)
           debugLog.log('agent', 'restarting loop after session setting change', {
             agentId: ctx.agentId,
             messageCount: streamMessages.length,
@@ -915,7 +948,9 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
       errorText: streamErrorText,
     }
   } catch (err) {
-    const message = formatError(err)
+    const message = isRetryableTransportError(err) && !(err instanceof Error && err.name === 'ModelIdleTimeoutError')
+      ? 'Connection interrupted. Progress through the last completed step was saved. Resume if offered, or review the last action before continuing.'
+      : formatError(err)
     // An abort is a user stop, not a failure: no agent-error row (the UI
     // settles streaming/running indicators itself when Stop is clicked).
     if (!emittedError && !signal.aborted) emit({ type: 'agent-error', agentId: ctx.agentId, error: message })
@@ -942,10 +977,8 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
 /** Query the active tab id; falls back to 0 if none can be determined. */
 export async function getActiveTabId(): Promise<number> {
   try {
-    const [active] = await chrome.tabs.query({ active: true, currentWindow: true })
+    const active = await getBrowserContextTab()
     if (active?.id !== undefined) return active.id
-    const [any] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
-    if (any?.id !== undefined) return any.id
   } catch (err) {
     debugLog.error('agent', 'getActiveTabId', err)
   }

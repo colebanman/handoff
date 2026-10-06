@@ -4,7 +4,7 @@ import { uid } from '../shared/ids'
 import { abortable, throwIfAborted } from '../shared/abort'
 import { reconcileReplContext } from '../shared/repl-context'
 
-export const COMPACTION_RATIO = 0.4
+export const COMPACTION_RATIO = 0.9
 
 type Item = Record<string, unknown>
 interface Checkpoint {
@@ -51,6 +51,8 @@ export class OpenAICompaction {
     /** Small exact docs for the currently relevant personal functions. */
     replContext?: () => string | undefined
     browserContext?: () => string | undefined
+    /** Derived memory is restored separately from the canonical compacted window. */
+    compactionInput?: (items: Item[]) => Item[]
   }) {}
 
   observeUsage(usage: Usage): void {
@@ -203,7 +205,7 @@ export class OpenAICompaction {
             .filter(Boolean).map((value) => typeof value === 'string' ? value : JSON.stringify(value)).join('\n\n')
           const response = await abortable(base(`${url}/compact`, {
             ...init, signal,
-            body: JSON.stringify({ model: body.model, input, instructions }),
+            body: JSON.stringify({ model: body.model, input: this.options.compactionInput?.(input) ?? input, instructions }),
           }), signal)
           if (!response.ok) {
             // Keep the original history and stop the turn. Never silently fall

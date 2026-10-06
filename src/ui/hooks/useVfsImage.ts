@@ -28,6 +28,10 @@ export function useVfsImage(path: string): VfsImageState {
   const [result, setResult] = useState<VfsImageState>(() => ({ src: cache.get(path), failed: false }))
 
   useEffect(() => {
+    if (!path) {
+      setResult({ src: undefined, failed: false })
+      return
+    }
     const cached = cache.get(path)
     if (cached) {
       setResult({ src: cached, failed: false })

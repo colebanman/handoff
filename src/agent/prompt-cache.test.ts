@@ -2,9 +2,15 @@ import { describe, expect, it } from 'vitest'
 import type { ModelMessage } from 'ai'
 import { createOpenAI } from '@ai-sdk/openai'
 import { RUNTIME_CONTEXT_START } from '../shared/context-blocks'
-import { buildSystemMessages, cacheRequestOptions, withCacheBreakpoints } from './prompt-cache'
+import { buildSystemMessages, cacheRequestOptions, supportsAnthropicPromptCache, withCacheBreakpoints } from './prompt-cache'
 
 describe('system message compatibility', () => {
+  it('enables the same explicit cache breakpoints for direct Claude and gateway models', () => {
+    expect(supportsAnthropicPromptCache('anthropic', 'claude-opus-5-5')).toBe(true)
+    expect(supportsAnthropicPromptCache('gateway', 'anthropic/claude-sonnet-5-5')).toBe(true)
+    expect(cacheRequestOptions('anthropic', 'claude-opus-5-5', 'session').providerOptions?.anthropic)
+      .toMatchObject({ thinking: { type: 'adaptive', display: 'summarized', blockBinding: { prefixMismatchBehavior: 'drop_block' } } })
+  })
   it('combines static and dynamic instructions for strict chat templates', () => {
     expect(buildSystemMessages({ staticPrompt: 'Base', dynamicPrompt: 'Custom' }, false)).toEqual([
       { role: 'system', content: 'Base\n\nCustom' },
@@ -22,8 +28,8 @@ describe('system message compatibility', () => {
   })
 })
 
-describe('Astra reasoning requests', () => {
-  it.each(['gpt-6-astra', 'openai/gpt-6-astra', 'gpt-6-astra-2026-09-10'])(
+describe('GPT-6 reasoning requests', () => {
+  it.each(['gpt-6.1-sol', 'openai/gpt-6.1-sol', 'gpt-6.1-sol-2026-09-29', 'gpt-6-astra', 'openai/gpt-6-astra', 'gpt-6-astra-2026-09-10', 'gpt-6-sol', 'openai/gpt-6-sol', 'gpt-6-luna', 'openai/gpt-6-luna'])(
     'sends reasoning summaries through the installed adapter for %s', async (modelId) => {
       let body: Record<string, unknown> = {}
       const openai = createOpenAI({ apiKey: 'test-key', fetch: async (_url, init) => {
@@ -38,7 +44,9 @@ describe('Astra reasoning requests', () => {
       const reader = result.stream.getReader()
       const first = await reader.read()
       await reader.cancel()
-      expect(body.reasoning).toEqual({ effort: 'low', summary: 'detailed' })
+      expect(body.reasoning).toEqual(modelId.includes('astra')
+        ? { effort: 'low', summary: 'detailed' }
+        : { summary: 'detailed' })
       expect(body.include).toContain('reasoning.encrypted_content')
       expect(first.value?.type).toBe('stream-start')
       if (first.value?.type === 'stream-start') {

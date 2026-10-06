@@ -1,5 +1,5 @@
 /**
- * Unlimited rate-limit retry and bounded transport retry for model calls.
+ * Unlimited rate-limit retry and connection-aware transport retry for model calls.
  * Transport retries apply to each model step, including after tool results,
  * and stop as soon as this request forwards content (so tools cannot replay).
  *
@@ -40,6 +40,9 @@ export interface RateLimitHooks {
   onWait?: (info: RateLimitWait) => void
   /** A retried request went through (or the attempt finished); the turn resumed. */
   onClear?: () => void
+  /** A transient network failure paused this request before model output. */
+  onConnectionWait?: (info: RateLimitWait & { offline: boolean }) => void
+  onConnectionClear?: () => void
   /**
    * Awaited before EVERY send attempt (the first one and each retry). Used to
    * make subagent requests yield to the main agent while it is stuck in a
@@ -116,6 +119,29 @@ const HOLD_BACK = new Set<string>(['stream-start', 'response-metadata', 'raw'])
 
 const MIN_DELAY_MS = 250
 const MAX_DELAY_MS = 5 * 60_000
+const MAX_TRANSPORT_RETRIES = 6
+
+export function isOffline(): boolean {
+  return typeof navigator !== 'undefined' && navigator.onLine === false
+}
+
+/** Timers also work after sleep/wake; an offline signal prevents futile sends. */
+export async function waitForConnection(
+  delayMs: number,
+  signal?: AbortSignal,
+  shouldRestart?: () => boolean,
+  onOffline?: () => void,
+): Promise<'done' | 'woke'> {
+  const delayed = await sleepUnless(delayMs, signal, shouldRestart)
+  if (delayed === 'woke') return delayed
+  let reportedOffline = false
+  while (isOffline()) {
+    if (shouldRestart?.()) return 'woke'
+    if (!reportedOffline) { onOffline?.(); reportedOffline = true }
+    await sleep(1000, signal)
+  }
+  return shouldRestart?.() ? 'woke' : 'done'
+}
 
 /**
  * Duck-typed rate-limit detection: walks the error object (including nested
@@ -315,17 +341,17 @@ export function rateLimitRetryMiddleware(hooks: RateLimitHooks = {}): LanguageMo
       const doStream = () => model.doStream({ ...params, abortSignal: signal })
       let attempt = 0
       let transportAttempts = 0
-      let waiting = false
+      let waiting: 'rate-limit' | 'connection' | undefined
 
       type Retry = { kind: 'rate-limit'; hit: RateLimitHit } | { kind: 'transport'; error: unknown }
       const retryFor = (error: unknown): Retry | undefined => {
         if (signal?.aborted || error instanceof AgentLoopRestartError) return undefined
         const hit = detectRateLimit(error)
         if (hit) return { kind: 'rate-limit', hit }
-        // One recovery attempt for a silent provider; two for immediate network
-        // failures. The run loop never multiplies these by replaying a turn.
+        // A silent provider gets one recovery attempt; network failures get a
+        // longer window so Wi-Fi can return without ending the user's task.
         if (error instanceof Error && error.name === 'ModelIdleTimeoutError' && transportAttempts >= 1) return undefined
-        if (transportAttempts < 2 && isRetryableTransportError(error)) return { kind: 'transport', error }
+        if (transportAttempts < MAX_TRANSPORT_RETRIES && isRetryableTransportError(error)) return { kind: 'transport', error }
         return undefined
       }
 
@@ -334,15 +360,17 @@ export function rateLimitRetryMiddleware(hooks: RateLimitHooks = {}): LanguageMo
       }
 
       const clear = (): void => {
-        if (!waiting) return
-        waiting = false
-        hooks.onClear?.()
+        const kind = waiting
+        waiting = undefined
+        if (kind === 'rate-limit') hooks.onClear?.()
+        if (kind === 'connection') hooks.onConnectionClear?.()
       }
 
       const wait = async (hit: RateLimitHit): Promise<void> => {
         attempt += 1
         const delayMs = resolveDelayMs(hit, attempt)
-        waiting = true
+        if (waiting && waiting !== 'rate-limit') clear()
+        waiting = 'rate-limit'
         hooks.onWait?.({ attempt, delayMs, message: hit.message })
         debugLog.log('agent', 'rate limited; retrying', { attempt, delayMs })
         const outcome = await sleepUnless(delayMs, signal, hooks.shouldRestart)
@@ -357,9 +385,14 @@ export function rateLimitRetryMiddleware(hooks: RateLimitHooks = {}): LanguageMo
       const waitForRetry = async (retry: Retry): Promise<void> => {
         if (retry.kind === 'rate-limit') return wait(retry.hit)
         transportAttempts += 1
-        const delayMs = 500 * 2 ** (transportAttempts - 1)
-        debugLog.error('agent', `model connection failed; retrying (${transportAttempts}/2)`, retry.error)
-        const outcome = await sleepUnless(delayMs, signal, hooks.shouldRestart)
+        const delayMs = Math.min(500 * 2 ** (transportAttempts - 1), 15_000)
+        if (waiting && waiting !== 'connection') clear()
+        waiting = 'connection'
+        hooks.onConnectionWait?.({ attempt: transportAttempts, delayMs, offline: isOffline(), message: 'Connection lost while contacting the model.' })
+        debugLog.error('agent', `model connection failed; retrying (${transportAttempts}/${MAX_TRANSPORT_RETRIES})`, retry.error)
+        const outcome = await waitForConnection(delayMs, signal, hooks.shouldRestart, () =>
+          hooks.onConnectionWait?.({ attempt: transportAttempts, delayMs: 0, offline: true, message: 'Waiting for internet connection.' }),
+        )
         if (outcome === 'woke') {
           clear()
           throw new AgentLoopRestartError()
@@ -475,7 +508,7 @@ export function rateLimitRetryMiddleware(hooks: RateLimitHooks = {}): LanguageMo
 }
 
 /**
- * Wrap a resolved model with unlimited rate-limit retries and at most two
+ * Wrap a resolved model with unlimited rate-limit retries and up to six
  * transport retries per request, before any content is forwarded.
  * String ids and v2-spec models pass through unwrapped (middleware is v3-only).
  */

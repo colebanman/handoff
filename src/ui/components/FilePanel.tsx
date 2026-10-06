@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import JSZip from 'jszip'
 import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
+import { MARKDOWN_REMARK_PLUGINS, MARKDOWN_REHYPE_PLUGINS } from '../markdown-plugins'
 import type { VfsEntry, VfsRoot, VfsSkillMetadata } from '../../shared/types'
 import { artifactUrl, isHtmlArtifactEntry, isVfsPath } from '../../shared/artifacts'
 import { isStickyPath, parseSticky, type StickyRuntimeMessage } from '../../shared/stickies'
@@ -565,14 +565,14 @@ export function FilePanel({ open, onClose, focusPath, focusNonce, onAttach }: Fi
             <div className="file-preview__markdown-split">
               {renderTextEditor(preview, draftText, setDraftText, setDirty)}
               <div className="file-preview__markdown">
-                <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: ArtifactMarkdownLink }}>
+                <ReactMarkdown remarkPlugins={MARKDOWN_REMARK_PLUGINS} rehypePlugins={MARKDOWN_REHYPE_PLUGINS} components={{ a: ArtifactMarkdownLink }}>
                   {preview.editable ? draftText : preview.text}
                 </ReactMarkdown>
               </div>
             </div>
           ) : (
             <div className="file-preview__markdown">
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: ArtifactMarkdownLink }}>
+              <ReactMarkdown remarkPlugins={MARKDOWN_REMARK_PLUGINS} rehypePlugins={MARKDOWN_REHYPE_PLUGINS} components={{ a: ArtifactMarkdownLink }}>
                 {preview.editable && dirty ? draftText : preview.text}
               </ReactMarkdown>
             </div>

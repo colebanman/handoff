@@ -6,6 +6,39 @@ function fold(events: AgentEvent[]): TranscriptItem[] {
   return events.reduce<TranscriptItem[]>((items, event) => applyEvent(items, event), [])
 }
 
+it('keeps a fully parsed tool input in preparation until the provider submits the call', () => {
+  const input = { code: 'return 1', intent: 'Reading courses' }
+  const preparing = fold([
+    { type: 'tool-input-start', agentId: 'main', toolCallId: 'read', toolName: 'sandbox_exec' },
+    { type: 'tool-input-delta', agentId: 'main', toolCallId: 'read', delta: JSON.stringify(input) },
+    { type: 'tool-input-delta', agentId: 'main', toolCallId: 'read', delta: ' \n' },
+  ])
+  expect(preparing[0]).toMatchObject({ input, inputStreaming: true, status: 'running' })
+  const executing = applyEvent(preparing, { type: 'tool-call', agentId: 'main', toolCallId: 'read', toolName: 'sandbox_exec', input })
+  expect(executing[0]).toMatchObject({ input, inputStreaming: false, status: 'running' })
+})
+
+it('drops only unsubmitted tool drafts when recovering a stalled model step', () => {
+  const items = fold([
+    { type: 'tool-input-start', agentId: 'main', toolCallId: 'draft', toolName: 'sandbox_exec' },
+    { type: 'tool-input-delta', agentId: 'main', toolCallId: 'draft', delta: '{"code":"return 1"}' },
+    { type: 'tool-call', agentId: 'main', toolCallId: 'started', toolName: 'sandbox_exec', input: { code: 'return 2' } },
+    { type: 'tool-input-start', agentId: 'main', toolCallId: 'finished', toolName: 'sandbox_exec' },
+    { type: 'tool-result', agentId: 'main', toolCallId: 'finished', toolName: 'sandbox_exec', output: 'Done', durationMs: 1 },
+  ])
+  const restarted = applyEvent(items, { type: 'connection-restart', agentId: 'main', partIds: [], toolCallIds: ['draft', 'started', 'finished'] })
+  expect(restarted.map(item => item.id)).toEqual(['started', 'finished'])
+  expect(restarted[1]).toMatchObject({ inputStreaming: false, status: 'done' })
+})
+
+it.each(['agent-finish', 'agent-error'] as const)('settles an unsubmitted tool draft on %s', (type) => {
+  const draft = fold([{ type: 'tool-input-start', agentId: 'main', toolCallId: 'draft', toolName: 'sandbox_exec' }])
+  const settled = applyEvent(draft, type === 'agent-finish'
+    ? { type, agentId: 'main', text: '' }
+    : { type, agentId: 'main', error: 'Model request stalled' })
+  expect(settled[0]).toMatchObject({ status: 'error', inputStreaming: false, output: expect.any(String) })
+})
+
 describe('subagent terminal state', () => {
   const task: TaskInfo = {
     id: 'task-1', agentId: 'sub-1', chatId: 'chat-1', kind: 'subagent',

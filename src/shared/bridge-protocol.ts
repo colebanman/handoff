@@ -11,14 +11,13 @@
  *                                       service worker
  *                                              |  chrome.runtime port
  *                                              v
- *                                        side panel (accepts bridge requests)
+ *                                        side panel (runs the turn)
  *
  * The service worker holds the socket rather than the panel for two reasons:
  * WebSocket traffic resets the SW idle timer (Chrome 116+), so the connection
  * keeps itself alive; and chats live in chrome.storage.local, so every *read*
  * (list/get/tool calls) can be served with the panel closed. Only running work
- * enters through the panel. Accepted turns run in the service worker and can
- * continue after the panel closes.
+ * needs the panel, because the agent runtime lives there and dies with it.
  */
 
 import type { VfsEntry, VfsRoot } from './types'

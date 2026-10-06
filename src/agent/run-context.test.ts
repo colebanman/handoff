@@ -8,6 +8,7 @@ import { resolveModel, resolveModelAccess } from './models'
 import { runLoop, type RunLoopOptions } from './run'
 import { AgentLoopRestartError } from './model-switch'
 import { renderBrowserSnapshot, parseBrowserSnapshotDelta } from '../shared/browser-snapshot'
+import { sanitizeModelMessages } from '../shared/model-messages'
 
 vi.mock('./models', () => ({ resolveModel: vi.fn(), resolveModelAccess: vi.fn() }))
 
@@ -47,8 +48,35 @@ function setup() {
 afterEach(() => { vi.unstubAllGlobals(); vi.clearAllMocks() })
 
 describe('runtime context through the real SDK tool loop', () => {
-  it('sends snapshot changes on the third model call but persists full snapshots for resume', async () => {
+  it('delivers steering context while keeping the logical working tab and clean UI text', async () => {
     const { options } = setup()
+    let delivered = false
+    options.steering = { take: () => delivered ? [] : (delivered = true, [{
+      text: 'Also check this page', browserContext: { text: '<context>\nLocal time: now\nActive tab: [42] New page\n</context>', tabId: 42 },
+    }]) }
+    const model = new MockLanguageModelV3({ doStream: async () => ({ stream: simulateReadableStream<StreamPart>({
+      initialDelayInMs: null, chunkDelayInMs: null, chunks: [
+        { type: 'text-start', id: 'answer' }, { type: 'text-delta', id: 'answer', delta: 'Understood.' },
+        { type: 'text-end', id: 'answer' }, { type: 'finish', finishReason: { unified: 'stop', raw: 'stop' }, usage },
+      ],
+    }) }) })
+    vi.mocked(resolveModel).mockReturnValue(model)
+    const result = await runLoop(options)
+    const request = JSON.stringify(model.doStreamCalls[0]!.prompt)
+    expect(request).toContain('Active tab: [42]')
+    expect(request).toContain('default to working tab 1')
+    expect(request).not.toContain('contextTabId')
+    expect(options.ctx.currentTabId).toBe(1)
+    expect(options.emit).toHaveBeenCalledWith({ type: 'steering', agentId: 'main', text: 'Also check this page' })
+    expect(JSON.stringify(result.responseMessages)).toContain('"contextTabId":42')
+  })
+  it.each(['openai', 'anthropic'] as const)('%s sends snapshot changes and persists full snapshots for resume', async (provider) => {
+    const { options } = setup()
+    if (provider === 'anthropic') {
+      options.settings = { ...options.settings, provider, modelId: 'claude-sonnet-5-5' }
+      options.modelId = options.settings.modelId
+      vi.mocked(resolveModelAccess).mockResolvedValue({ settings: options.settings })
+    }
     let revision = 0
     options.deps.cdp.snapshot = async () => ({ tabId: 1, title: 'Form', url: 'https://example.test', text: renderBrowserSnapshot({
       tabId: 1, document: 'live', revision: ++revision, header: 'URL https://example.test | title Form | tab 1',
@@ -83,6 +111,12 @@ describe('runtime context through the real SDK tool loop', () => {
     const persistedTools = checkpointed.filter((message) => message.role === 'tool')
     expect(JSON.stringify(persistedTools)).toContain('revision=1')
     expect(JSON.stringify(persistedTools)).not.toContain('superseded')
+    if (provider === 'anthropic') {
+      // The next turn must reproduce the identical wire prefix: pruning the
+      // earlier snapshot would invalidate every subsequent thinking signature.
+      const prefix = sanitizeModelMessages(model.doStreamCalls[2]!.prompt)
+      expect(sanitizeModelMessages(model.doStreamCalls[3]!.prompt).slice(0, prefix.length)).toEqual(prefix)
+    }
   })
 
   it('refreshes memory after an actual tool write and persists the exact append-only context for resume', async () => {

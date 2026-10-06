@@ -118,6 +118,8 @@ export const SANDBOX_API_PATHS = [
   'page.fetch',
   'page.click',
   'page.type',
+  'page.fill',
+  'page.select',
   'page.pressKey',
   'page.scroll',
   'page.navigate',

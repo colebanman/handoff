@@ -11,6 +11,7 @@
 import type { ChatRecord } from '../shared/types'
 import { redactSecrets } from '../shared/redact'
 import { listChats, getChat } from './chats'
+import type { MemorySnapshot } from '../shared/continuity'
 
 export interface ChatExport {
   version: 1
@@ -19,6 +20,7 @@ export interface ChatExport {
   /** Base64 media replaced with "[stripped N chars, mediaType]" stubs. */
   mediaStripped: true
   chats: ChatRecord[]
+  memory?: MemorySnapshot
 }
 
 /** Keys that carry base64 media in ModelMessages / tool outputs / transcripts. */
@@ -51,12 +53,16 @@ export async function buildChatExport(): Promise<ChatExport> {
     const chat = await getChat(meta.id)
     if (chat) chats.push(stripMedia(chat) as ChatRecord)
   }
+  let memory: MemorySnapshot | undefined
+  const response = await chrome.runtime.sendMessage({ target: 'background', type: 'memory.command', payload: { command: 'list' } }).catch(() => undefined) as { ok?: boolean; value?: MemorySnapshot } | undefined
+  if (response?.ok && response.value) memory = stripMedia(response.value) as MemorySnapshot
   return {
     version: 1,
     exportedAt: new Date().toISOString(),
     chatCount: chats.length,
     mediaStripped: true,
     chats,
+    ...(memory ? { memory } : {}),
   }
 }
 

@@ -10,6 +10,7 @@
  */
 
 import type { ChatOrigin } from './bridge-protocol'
+import type { ContextUsageInfo, RequestContextUsage } from './context-usage'
 
 import type { BrowserContextAttachment } from './browser-events'
 import type { JsonValue } from './rpc'
@@ -93,7 +94,7 @@ export type AgentEvent =
       workflowRunId?: string
       workflowCallId?: string
     }
-  | { type: 'usage-update'; agentId: AgentId; modelId: string; usage: Usage }
+  | { type: 'usage-update'; agentId: AgentId; modelId: string; usage: Usage; context?: RequestContextUsage }
   | { type: 'compaction'; agentId: AgentId; id: string; status: 'running' | 'done' | 'error' | 'cancelled' }
   | { type: 'reasoning-start'; agentId: AgentId; id: string }
   | { type: 'reasoning-delta'; agentId: AgentId; id: string; delta: string }
@@ -103,15 +104,17 @@ export type AgentEvent =
   | { type: 'text-end'; agentId: AgentId; id: string }
   | { type: 'tool-input-start'; agentId: AgentId; toolCallId: string; toolName: string }
   | { type: 'tool-input-delta'; agentId: AgentId; toolCallId: string; delta: string }
-  | { type: 'tool-call'; agentId: AgentId; toolCallId: string; toolName: string; input: unknown }
+  | { type: 'tool-call'; agentId: AgentId; toolCallId: string; toolName: string; input: unknown; harnessVersion?: string; executionId?: string }
   | { type: 'tool-result'; agentId: AgentId; toolCallId: string; toolName: string; output: unknown; durationMs: number; isError?: boolean }
   /** A steering message attached to the running turn at a step boundary (after tool results). */
   | { type: 'steering'; agentId: AgentId; text: string }
   /** The provider rate-limited the request; the turn is paused and will retry indefinitely.
    * `waitingForMain` marks a subagent holding its retry until the main agent's request goes through. */
-  | { type: 'rate-limit'; agentId: AgentId; attempt: number; retryInMs: number; message?: string; waitingForMain?: boolean }
+  | { type: 'rate-limit'; agentId: AgentId; attempt: number; retryInMs: number; message?: string; waitingForMain?: boolean; kind?: 'rate-limit' | 'connection'; offline?: boolean }
   /** A rate-limited request went through; the turn resumed. */
   | { type: 'rate-limit-clear'; agentId: AgentId }
+  /** Discard text from a broken model step before safely replaying that step. */
+  | { type: 'connection-restart'; agentId: AgentId; partIds: string[]; toolCallIds?: string[] }
   /** The agent switched models mid-task (e.g. OpenAI rate-limit → Grok). Context is preserved. */
   | { type: 'model-switch'; agentId: AgentId; modelId: string; previousModelId: string }
   | { type: 'agent-finish'; agentId: AgentId; text: string; usage?: Usage; finishReason?: string }
@@ -140,7 +143,7 @@ export type AgentEvent =
 export type ToolStatus = 'running' | 'done' | 'error'
 
 /**
- * An image attached to an outgoing user message (drag-drop/paste upload, or an
+ * A file attached to an outgoing user message (drag-drop/paste upload, or an
  * "Appshot" capture of the active tab). The image bytes live in the VFS at
  * `path`; the transcript persists only this metadata and the feed re-reads the
  * file to render the embed. Appshots also carry the capture-time tab metadata
@@ -148,8 +151,8 @@ export type ToolStatus = 'running' | 'done' | 'error'
  */
 export interface UserAttachment {
   id: string
-  kind: 'image' | 'appshot'
-  /** VFS path of the stored image, e.g. /workspace/appshots/appshot-….png */
+  kind: 'image' | 'file' | 'appshot'
+  /** VFS path of the stored file, e.g. /workspace/attachments/report.pdf */
   path: string
   name: string
   mediaType: string
@@ -172,7 +175,8 @@ export type TranscriptItem =
    *  `pending` marks steering the model hasn't received yet (render-only synthetic item — never persisted).
    *  `source` marks a programmatic prompt (an artifact's ai.invoke) so the feed can badge it. */
   | { kind: 'user'; id: string; text: string; at: number; steered?: boolean; pending?: boolean; attachments?: UserAttachment[]; contexts?: BrowserContextAttachment[]; source?: UserMessageSource }
-  | { kind: 'reasoning'; id: string; agentId: AgentId; text: string; streaming: boolean; durationMs?: number }
+  /** `at`: when the part started (absent on transcripts saved before it was recorded). */
+  | { kind: 'reasoning'; id: string; agentId: AgentId; text: string; streaming: boolean; durationMs?: number; at?: number }
   | { kind: 'text'; id: string; agentId: AgentId; text: string; streaming: boolean; at?: number }
   | { kind: 'compaction'; id: string; agentId: AgentId; status: 'running' | 'done' | 'error' | 'cancelled' }
   | {
@@ -180,9 +184,14 @@ export type TranscriptItem =
       id: string // === toolCallId
       agentId: AgentId
       toolName: string
+      /** Actual execution build; absent for historical records with unknown contracts. */
+      harnessVersion?: string
+      executionId?: string
       /** Raw streamed JSON while args stream in; parsed input once complete. */
       inputText: string
       input?: unknown
+      /** The model is still generating arguments; the tool has not started. */
+      inputStreaming?: boolean
       /**
        * Length of inputText when `input` was last re-parsed. Large streaming
        * inputs are re-parsed on a growth threshold instead of every delta
@@ -193,6 +202,8 @@ export type TranscriptItem =
       status: ToolStatus
       durationMs?: number
       at: number
+      /** When the result arrived; `at` is when the model began writing the call. */
+      endedAt?: number
       /** For subagent_spawn calls: the child feed rendered nested inside this card. */
       childAgentId?: AgentId
       childItems?: TranscriptItem[]
@@ -235,15 +246,14 @@ export interface TaskInfo {
 /* Settings & models                                                   */
 /* ------------------------------------------------------------------ */
 
-export type ProviderKind = 'gateway' | 'openai' | 'openai-compatible' | 'xai' | 'cerebras'
+export type ProviderKind = 'gateway' | 'openai' | 'openai-compatible' | 'xai' | 'cerebras' | 'anthropic'
 
 export interface Settings {
-  /** Experimental decision service; disabled unless explicitly enabled with a key. */
-  typeSafeEnabled?: boolean
-  typeSafeApiKey?: string
   provider: ProviderKind
   /** How direct OpenAI requests authenticate. Absent preserves the legacy API-key path. */
   openaiAuthMode?: 'api-key' | 'chatgpt'
+  /** Direct Claude requests use the subscription unless API-key billing is explicitly selected. */
+  anthropicAuthMode?: 'claude' | 'api-key'
   /** API key for the ACTIVE provider (what resolveModel reads). Kept in sync with `apiKeys`. */
   apiKey: string
   /**
@@ -365,9 +375,10 @@ export const DEFAULT_MODEL_ID = 'grok-4.6'
 export const OPENAI_DEFAULT_MODEL_ID = 'gpt-5.6-sol'
 export const XAI_DEFAULT_MODEL_ID = 'grok-4.6'
 export const CEREBRAS_DEFAULT_MODEL_ID = 'qwen-3.8-27b'
+export const ANTHROPIC_DEFAULT_MODEL_ID = 'claude-opus-5-5'
 
 /** Providers with curated entries in the model picker. */
-export type CuratedModelProvider = 'openai' | 'xai' | 'openai-compatible' | 'cerebras'
+export type CuratedModelProvider = 'openai' | 'xai' | 'openai-compatible' | 'cerebras' | 'anthropic'
 
 export interface ModelOption {
   id: string
@@ -390,10 +401,15 @@ export const LOCAL_ENDPOINT_PLACEHOLDER_KEY = 'local'
 
 /** Curated picker options; free-text custom ids are also allowed. */
 export const MODEL_OPTIONS: ModelOption[] = [
+  { id: 'gpt-6.1-sol', label: 'GPT-6.1 Sol', provider: 'openai' },
   { id: 'gpt-6-astra', label: 'GPT-6 Astra', provider: 'openai' },
+  { id: 'gpt-6-sol', label: 'GPT-6 Sol', provider: 'openai' },
+  { id: 'gpt-6-luna', label: 'GPT-6 Luna', provider: 'openai' },
   { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', provider: 'openai' },
   { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra', provider: 'openai' },
   { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna', provider: 'openai' },
+  { id: ANTHROPIC_DEFAULT_MODEL_ID, label: 'Claude Opus 5.5', provider: 'anthropic', contextWindow: 1_000_000 },
+  { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5', provider: 'anthropic', contextWindow: 1_000_000 },
   { id: 'grok-4.6', label: 'Grok 4.6', provider: 'xai' },
   { id: 'grok-4.6-fast', label: 'Grok 4.6 Fast', provider: 'xai' },
   { id: CEREBRAS_DEFAULT_MODEL_ID, label: 'Qwen 3.8 27B', provider: 'cerebras' },
@@ -454,11 +470,12 @@ export function toolOutputLimitForModel(modelId: string): number | undefined {
 /**
  * Settings a curated pick pins.
  *
- * A curated entry always owns its provider, so selecting one switches provider
+ * A curated entry owns its provider, so selecting one switches provider
  * (and pulls that provider's vaulted key) even from `openai-compatible` —
  * otherwise picking GPT while a local model is active would send the GPT id to
  * the local server. A free-text custom id keeps the old behaviour and never
- * overrides a user-configured proxy.
+ * overrides a user-configured proxy. Claude entries retain an explicitly
+ * selected gateway route and its credential.
  *
  * `pinEndpoint` is for request-time resolution only: it materializes the local
  * `baseURL` and placeholder key. Persisted settings leave `baseURL` untouched
@@ -471,13 +488,23 @@ export function pinnedSettingsForModel(
 ): Settings {
   const id = modelId.trim()
   const next: Settings = { ...settings, modelId: id }
+  if (settings.provider === 'gateway' && isAnthropicModelId(id)) {
+    next.modelId = `anthropic/${id.replace(/^anthropic\//i, '')}`
+    next.apiKey = settings.apiKeys?.gateway ?? settings.apiKey
+    return next
+  }
   const option = MODEL_OPTIONS.find((m) => m.id === id)
-  const targetProvider = option?.provider ?? (isOpenAIModelId(id) ? 'openai' : undefined)
+  const targetProvider = option?.provider ?? (isOpenAIModelId(id) ? 'openai' : isAnthropicModelId(id) ? 'anthropic' : undefined)
   if (!targetProvider) return next
   if (!option && settings.provider === 'openai-compatible') return next
   if (targetProvider !== settings.provider) {
     next.provider = targetProvider
     next.apiKey = settings.apiKeys?.[targetProvider] ?? ''
+  }
+  if (targetProvider === 'anthropic') {
+    next.modelId = id.replace(/^anthropic\//i, '')
+    next.anthropicAuthMode = settings.anthropicAuthMode === 'api-key' ? 'api-key' : 'claude'
+    if (next.anthropicAuthMode === 'claude') next.apiKey = ''
   }
   if (opts.pinEndpoint && option?.baseURL) {
     next.baseURL = option.baseURL
@@ -519,6 +546,11 @@ export function isOpenAIModelId(modelId: string): boolean {
     bare.startsWith('codex-') ||
     /^o\d(?:-|$)/.test(bare)
   )
+}
+
+/** Claude IDs may be curated, entered directly, or prefixed for a gateway. */
+export function isAnthropicModelId(modelId: string): boolean {
+  return /^(?:anthropic\/|claude-)/i.test(modelId.trim())
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -568,6 +600,8 @@ export interface ChatRecord {
   createdAt: number
   updatedAt: number
   modelId: string
+  /** Last main-agent request measurement; never accumulated billing usage. */
+  contextUsage?: ContextUsageInfo
   /** ModelMessage[] from the AI SDK — the model-facing history, opaque here. */
   messages: unknown[]
   /** UI-facing rendered history. */
@@ -704,13 +738,16 @@ export interface CdpService {
   detachAll(): Promise<void>
   /** Raw CDP. Attaches on demand. */
   send<T = unknown>(tabId: number, method: string, params?: object, signal?: AbortSignal): Promise<T>
-  /** AX-tree snapshot. Registers refs for this tab (invalidates previous refs). */
+  /** AX-tree snapshot. Reuses live document refs and expires removed nodes. */
   snapshot(tabId: number, visibleTabIds?: number[]): Promise<SnapshotResult>
   click(tabId: number, ref: string, signal?: AbortSignal): Promise<void>
-  /** A durable CSS selector for a snapshot ref (refs themselves expire with the snapshot). */
+  /** A durable CSS selector for a snapshot ref (refs expire with their node/document). */
   selectorForRef(tabId: number, ref: string, signal?: AbortSignal): Promise<{ selector: string; label: string }>
   /** Focus element, optionally clear, insert text, optionally press Enter. */
   type(tabId: number, ref: string, text: string, opts?: { clear?: boolean; submit?: boolean; signal?: AbortSignal }): Promise<void>
+  /** Verified local form operations; no intermediate model-facing snapshots. */
+  fill(tabId: number, fields: import('./form-fill').FormField[], signal?: AbortSignal): Promise<import('./form-fill').FormFillResult>
+  select(tabId: number, ref: string, option: string, signal?: AbortSignal): Promise<import('./form-fill').FormFillResult>
   /** key: 'Enter' | 'Tab' | 'Escape' | 'ArrowDown' | 'ctrl+a' | ... */
   pressKey(tabId: number, key: string, signal?: AbortSignal): Promise<void>
   scroll(tabId: number, opts: { ref?: string; dy?: number; signal?: AbortSignal }): Promise<void>
@@ -744,8 +781,12 @@ export interface CdpService {
 
 /** undefined allowedTabIds = unrestricted (main agent). */
 export interface TabScope {
+  /** Stable sandbox session, also the namespace for scratch KV storage. */
+  sessionId?: string
   /** Identity of the agent this scope belongs to ('main' | 'sub-…'). */
   agentId?: string
+  /** Browser ownership identity; main agents need one per chat/run. */
+  surfaceOwnerId?: string
   /** True when the agent holds no browser surface at all. */
   offlineOnly?: boolean
   /** Exact extension revisions advertised in the current model step. */
@@ -886,7 +927,7 @@ export interface VirtualFileSystemService {
   blob(path: string): Promise<Blob>
   dataUrl(path: string): Promise<string>
   renderPdfPage(path: string, opts?: { page?: number; scale?: number; signal?: AbortSignal }): Promise<VfsRenderedPage>
-  search(query: string, opts?: { root?: VfsRoot; maxResults?: number }): Promise<Array<{ path: string; lines: VfsLineResult['lines'] }>>
+  search(query: string, opts?: { root?: VfsRoot; prefix?: string; maxResults?: number }): Promise<Array<{ path: string; lines: VfsLineResult['lines'] }>>
 }
 
 /* ------------------------------------------------------------------ */
@@ -913,7 +954,7 @@ export interface TurnResult {
  * the caller's responsibility (e.g. send it as a follow-up message).
  */
 export interface SteeringFeed {
-  take(): string[]
+  take(): Array<string | { text: string; browserContext?: import('./browser-context').BrowserMessageContext }>
   /** Non-consuming check for pending steering, so blocking tools (task_wait) can return early. */
   peek?(): boolean
 }

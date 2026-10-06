@@ -1,5 +1,6 @@
 import type { AgentEvent, ChatRecord, RunTurnOptions, SnapshotResult, TaskInfo, TurnResult } from './types'
 import type { UserPromptAnswer, UserPromptRequest } from './user-prompt'
+import type { BrowserMessageContext } from './browser-context'
 
 export const AGENT_HOST_PORT = 'agent-execution-host-v1'
 export const EXECUTION_KEY_PREFIX = 'agent-execution:'
@@ -34,9 +35,13 @@ export interface ExecutionSnapshot {
   startedAt: number
   updatedAt: number
   eventSeq: number
+  /** Transcript prefix whose model messages were durably committed after a step. */
+  committedTranscriptLength?: number
   result?: TurnResult
   error?: string
   interaction?: ExecutionInteraction
+  /** Current request waits survive a panel reconnect. */
+  waits?: Record<string, { agentId: string; attempt: number; retryAt: number; message?: string; waitingForMain?: boolean; kind?: 'rate-limit' | 'connection'; offline?: boolean }>
 }
 
 export interface SerializableRunOptions {
@@ -54,7 +59,7 @@ export interface SerializableRunOptions {
 export type AgentHostClientMessage =
   | { type: 'start'; runId: string; options: SerializableRunOptions }
   | { type: 'cancel'; runId?: string; chatId?: string }
-  | { type: 'steer'; chatId: string; text: string }
+  | { type: 'steer'; chatId: string; text: string; browserContext?: BrowserMessageContext }
   | { type: 'interaction-result'; runId: string; requestId: string; value: boolean | UserPromptAnswer | string }
   | { type: 'task-cancel'; taskId: string }
   | { type: 'task-nudge'; taskId: string; text: string }

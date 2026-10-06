@@ -1,6 +1,96 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { CdpService, VirtualFileSystemService, VfsEntry } from '../shared/types'
 import { createApiDispatch } from './api-dispatch'
+import { resetSharedSurfaceAssignments, sharedSurfaceAssignments } from '../agent/surfaces'
+
+afterEach(() => { vi.unstubAllGlobals(); resetSharedSurfaceAssignments() })
+
+describe('documented sandbox contracts', () => {
+  it('refuses tab and group mutations that would interfere with a running child', async () => {
+    sharedSurfaceAssignments().claim('sub-a', [7])
+    const remove = vi.fn(), update = vi.fn()
+    vi.stubGlobal('chrome', { tabs: { remove, query: async () => [{ id: 7 }] }, tabGroups: { update } })
+    const dispatch = createApiDispatch({} as CdpService, {} as VirtualFileSystemService, { agentId: 'main', surfaceOwnerId: 'main:chat-b' })
+    await expect(dispatch('tabs.close', [7])).rejects.toThrow('owned by sub-a')
+    await expect(dispatch('tabGroups.update', [3, { collapsed: true }])).rejects.toThrow('owned by sub-a')
+    expect(remove).not.toHaveBeenCalled()
+    expect(update).not.toHaveBeenCalled()
+  })
+  it('isolates main-agent scratch data and restores it for the same sandbox session', async () => {
+    const make = (sessionId: string) => createApiDispatch({} as CdpService, {} as VirtualFileSystemService, { agentId: 'main', sessionId })
+    await make('chat-a')('storage.set', ['records', ['account A']])
+    await expect(make('chat-b')('storage.get', ['records'])).resolves.toBeNull()
+    await expect(make('chat-a')('storage.get', ['records'])).resolves.toEqual(['account A'])
+  })
+
+  it('rejects implicit partial text reads but supports intentional excerpts and pagination', async () => {
+    const readText = vi.fn().mockResolvedValue({ text: 'prefix', totalChars: 200_000, truncated: true })
+    const dispatch = createApiDispatch({} as CdpService, { readText } as unknown as VirtualFileSystemService)
+    await expect(dispatch('fs.readText', ['/workspace/large.csv'])).rejects.toThrow('api.fs.extractText')
+    await expect(dispatch('fs.readText', ['/workspace/large.csv', { maxChars: 6 }])).resolves.toBe('prefix')
+    await expect(dispatch('fs.extractText', ['/workspace/large.csv'])).resolves.toMatchObject({ truncated: true, totalChars: 200_000 })
+  })
+
+  it('passes the advertised search scope to VFS before limiting results', async () => {
+    const search = vi.fn().mockResolvedValue([])
+    const dispatch = createApiDispatch({} as CdpService, { search } as unknown as VirtualFileSystemService)
+    await dispatch('fs.search', ['record', { rootOrPath: '/workspace/project', maxResults: 2 }])
+    expect(search).toHaveBeenCalledWith('record', { root: 'workspace', prefix: '/workspace/project', maxResults: 2 })
+  })
+
+  it('adds to a returned group rather than silently creating another one', async () => {
+    const group = vi.fn().mockResolvedValue(17)
+    vi.stubGlobal('chrome', { tabs: { group } })
+    const dispatch = createApiDispatch({} as CdpService, {} as VirtualFileSystemService)
+    const result = await dispatch('tabs.group', [{ tabIds: [1, 2] }])
+    expect(result).toEqual({ groupId: 17, tabIds: [1, 2] })
+    await dispatch('tabs.group', [{ tabIds: [3], groupId: result }])
+    expect(group).toHaveBeenLastCalledWith({ tabIds: [3], groupId: 17 })
+    await expect(dispatch('tabs.group', [{ tabIds: [3], groupId: 'invalid' }])).rejects.toThrow('numeric groupId')
+    expect(group).toHaveBeenCalledTimes(2)
+  })
+
+  it('throws on binary page.fetch bodies while preserving ordinary HTTP errors', async () => {
+    const evalInPage = vi.fn().mockResolvedValueOnce({ ok: true, binary: true, error: 'Use api.fs.importUrl' })
+      .mockResolvedValueOnce({ ok: false, status: 403, text: 'Forbidden' })
+    const dispatch = createApiDispatch({ evalInPage } as unknown as CdpService, {} as VirtualFileSystemService)
+    await expect(dispatch('page.fetch', [7, 'https://example.com/a.pdf'])).rejects.toThrow('api.fs.importUrl')
+    await expect(dispatch('page.fetch', [7, 'https://example.com/a.json'])).resolves.toMatchObject({ ok: false, status: 403 })
+  })
+})
+
+describe('offline sandbox scope', () => {
+  it('supports paginated file reads, writes, and isolated scratch storage', async () => {
+    const page = { path: '/workspace/pack.json', text: 'tail', truncated: false, totalChars: 104 }
+    const readText = vi.fn().mockResolvedValue(page)
+    const writeText = vi.fn().mockResolvedValue({ path: '/workspace/result.json' })
+    const dispatch = createApiDispatch({} as CdpService, { readText, writeText } as unknown as VirtualFileSystemService, {
+      offlineOnly: true, allowedTabIds: [],
+    })
+    await expect(dispatch('fs.extractText', ['/workspace/pack.json', { offset: 100, maxChars: 4 }])).resolves.toEqual(page)
+    expect(readText).toHaveBeenCalledWith('/workspace/pack.json', { offset: 100, maxChars: 4 })
+    await dispatch('fs.writeText', ['/workspace/result.json', '[]'])
+    expect(writeText).toHaveBeenCalledWith('/workspace/result.json', '[]', expect.anything())
+    await dispatch('storage.set', ['count', 130])
+    await expect(dispatch('storage.get', ['count'])).resolves.toBe(130)
+    const other = createApiDispatch({} as CdpService, {} as VirtualFileSystemService, { offlineOnly: true, allowedTabIds: [] })
+    await expect(other('storage.get', ['count'])).resolves.toBeNull()
+  })
+
+  it.each([
+    'fetch', 'fs.importUrl', 'require.source', 'cdp',
+    'page.eval', 'page.navigate', 'page.fetch', 'frames.eval', 'net.body',
+    'tabs.list', 'tabs.create', 'tabs.get', 'tabGroups.list',
+    'history.search', 'bookmarks.search', 'downloads.search',
+    'artifacts.create', 'artifacts.eval', 'artifacts.open',
+    'extensions.resolve', 'automations.create', 'stickies.open', 'fs.futureApi',
+  ])('rejects %s before dispatching it', async (path) => {
+    const dispatch = createApiDispatch({} as CdpService, {} as VirtualFileSystemService, {
+      offlineOnly: true, allowedTabIds: [],
+    })
+    await expect(dispatch(path, [])).rejects.toThrow(`api.${path} is unavailable to offline-only subagents`)
+  })
+})
 
 describe('site-context tab observations', () => {
   it('reports explicit and default sandbox tabs only after scope validation', async () => {
@@ -178,5 +268,31 @@ describe('tabs.activate choreography', () => {
     expect(chrome.tabs.update).toHaveBeenCalledWith(5, { active: true })
     expect(setCurrentTabId).toHaveBeenCalledWith(5)
     vi.unstubAllGlobals()
+  })
+})
+
+describe('verified form sandbox APIs', () => {
+  it('forwards default and explicit tab calls to the shared driver with cancellation', async () => {
+    const result = { ok: true, fields: [{ ref: 'e1', status: 'verified' }] }
+    const fill = vi.fn().mockResolvedValue(result), select = vi.fn().mockResolvedValue(result)
+    const controller = new AbortController()
+    const dispatch = createApiDispatch({ fill, select } as unknown as CdpService, {} as VirtualFileSystemService,
+      { getCurrentTabId: () => 7, allowedTabIds: [7] }, controller.signal)
+    await expect(dispatch('page.fill', [[{ ref: 'e1', select: 'No' }]])).resolves.toEqual(result)
+    expect(fill).toHaveBeenCalledWith(7, [{ ref: 'e1', select: 'No' }], controller.signal)
+    await dispatch('page.select', [7, 'e1', 'Yes'])
+    await dispatch('page.select', ['e1', 'No'])
+    expect(select).toHaveBeenLastCalledWith(7, 'e1', 'No', controller.signal)
+    await expect(dispatch('page.fill', [8, [{ ref: 'e1', checked: true }]])).rejects.toThrow('scope')
+    await expect(dispatch('page.fill', [7, [{ ref: 'e1', text: 'a', select: 'No' }]])).rejects.toThrow()
+    await expect(dispatch('page.select', [7, 'e1', ' '])).rejects.toThrow()
+    expect(fill).toHaveBeenCalledTimes(1)
+    controller.abort()
+    await expect(dispatch('page.select', [7, 'e1', 'No'])).rejects.toMatchObject({ name: 'AbortError' })
+    expect(select).toHaveBeenCalledTimes(2)
+  })
+  it.each(['page.fill', 'page.select'])('rejects %s in offline mode before browser access', async path => {
+    const dispatch = createApiDispatch({} as CdpService, {} as VirtualFileSystemService, { offlineOnly: true, allowedTabIds: [] })
+    await expect(dispatch(path, [])).rejects.toThrow('offline-only')
   })
 })

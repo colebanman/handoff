@@ -35,7 +35,7 @@ describe('custom REPL docs in the actual post-compaction request', () => {
       if (String(url).endsWith('/compact')) return Response.json({ output: [opaque] })
       sent = JSON.parse(init!.body as string); return Response.json({})
     }
-    await compaction.wrapFetch(fetcher)('https://test/responses', { body: JSON.stringify({ input: [item('x'.repeat(2000))] }) })
+    await compaction.wrapFetch(fetcher)('https://test/responses', { body: JSON.stringify({ input: [item('x'.repeat(3000))] }) })
     expect(count(sent.input)).toBe(1)
     expect(JSON.stringify(sent)).toContain('Continue the task')
   })
@@ -54,6 +54,6 @@ describe('custom REPL docs in the actual post-compaction request', () => {
     expect(count(sent.input)).toBe(1)
     expect(JSON.stringify(sent)).toContain('searchModules')
     expect(JSON.stringify(sent)).not.toContain('canvas.search(')
-    expect(sent.context_management[0].compact_threshold).toBe(400)
+    expect(sent.context_management[0].compact_threshold).toBe(900)
   })
 })

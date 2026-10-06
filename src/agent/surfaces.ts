@@ -11,9 +11,9 @@
  *
  *   1. A soft claim never fails and never displaces anything: if a subagent
  *      already holds the surface, main simply does not get a claim on it.
- *   2. While main holds a soft claim on surface S, a `subagent_spawn` asking
- *      for S is refused with the same "already assigned" error as a tab
- *      conflict — the main agent is mid-task on it.
+ *   2. Ordinary hard claims respect soft claims too. Delegation explicitly
+ *      hands the parent's soft claims to its child, atomically with claiming
+ *      the rest of the assigned tabs. Another agent's claims still conflict.
  *   3. A soft claim expires on its own {@link SOFT_CLAIM_TTL_MS} after the main
  *      agent's last action on that surface, and every further action refreshes
  *      it. Expiry rather than an explicit turn-teardown hook keeps the rule out
@@ -69,6 +69,7 @@ export interface SurfaceAssignmentsOptions {
 
 export class SurfaceAssignments {
   private readonly ownerByKey = new Map<string, ClaimRecord>()
+  private readonly activeByKey = new Map<string, number>()
   private readonly listeners = new Set<() => void>()
   private readonly now: () => number
   private readonly softTtlMs: number
@@ -82,7 +83,7 @@ export class SurfaceAssignments {
   private sweep(): void {
     const now = this.now()
     for (const [key, record] of this.ownerByKey) {
-      if (record.soft && record.expiresAt !== undefined && record.expiresAt <= now) this.ownerByKey.delete(key)
+      if (record.soft && record.expiresAt !== undefined && record.expiresAt <= now && !this.activeByKey.has(key)) this.ownerByKey.delete(key)
     }
   }
 
@@ -94,13 +95,15 @@ export class SurfaceAssignments {
 
   /**
    * Claims every surface for agentId exclusively, or returns the first conflict
-   * and claims NONE of them (all-or-nothing).
+   * and changes NONE of them (all-or-nothing). Delegation may transfer soft
+   * claims from its parent; hard claims and other agents' soft claims never yield.
    */
-  claimSurfaces(agentId: string, surfaces: AgentSurface[]): SurfaceConflict | undefined {
+  claimSurfaces(agentId: string, surfaces: AgentSurface[], options: { handoffFromAgentId?: string } = {}): SurfaceConflict | undefined {
     this.sweep()
     for (const surface of surfaces) {
       const held = this.ownerByKey.get(surfaceKey(surface))
-      if (held && held.ownerAgentId !== agentId) {
+      const handoff = held?.soft && held.ownerAgentId === options.handoffFromAgentId && !this.activeByKey.has(surfaceKey(surface))
+      if (held && held.ownerAgentId !== agentId && !handoff) {
         return { surface: held.surface, ownerAgentId: held.ownerAgentId, tabId: held.surface.tabId, soft: held.soft }
       }
     }
@@ -135,6 +138,36 @@ export class SurfaceAssignments {
     }
     if (mutated) this.changed()
     return granted
+  }
+
+  /** Reserve the actual operation, not just its model's intention. Active
+   * calls cannot expire or be handed to a child until their effects settle. */
+  beginUse(agentId: string, surfaces: AgentSurface[]): () => void {
+    this.sweep()
+    const unique = [...new Map(surfaces.map(surface => [surfaceKey(surface), surface])).values()]
+    for (const surface of unique) {
+      const held = this.ownerByKey.get(surfaceKey(surface))
+      if (held && held.ownerAgentId !== agentId) {
+        throw new Error(`${describeSurface(surface)} is owned by ${held.ownerAgentId}. Wait for that agent to finish or use a different prepared tab; no action was dispatched.`)
+      }
+    }
+    this.softClaim(agentId, unique)
+    for (const surface of unique) {
+      const key = surfaceKey(surface)
+      this.activeByKey.set(key, (this.activeByKey.get(key) ?? 0) + 1)
+    }
+    let ended = false
+    return () => {
+      if (ended) return
+      ended = true
+      for (const surface of unique) {
+        const key = surfaceKey(surface), count = this.activeByKey.get(key) ?? 0
+        if (count <= 1) this.activeByKey.delete(key)
+        else this.activeByKey.set(key, count - 1)
+        const held = this.ownerByKey.get(key)
+        if (held?.soft && held.ownerAgentId === agentId) held.expiresAt = this.now() + this.softTtlMs
+      }
+    }
   }
 
   /** Back-compat tab API: claims tab surfaces for agentId, all-or-nothing. */
@@ -194,8 +227,30 @@ export class SurfaceAssignments {
   invalidateTabs(): void {
     if (!this.ownerByKey.size) return
     this.ownerByKey.clear()
+    this.activeByKey.clear()
     this.changed()
   }
+}
+
+const CDP_TAB_OPERATIONS = new Set(['attach', 'detach', 'send', 'snapshot', 'click', 'type', 'pressKey',
+  'scroll', 'navigate', 'evalInPage', 'attachFiles', 'selectorForRef', 'fill', 'select', 'listFrames',
+  'evalInFrame', 'clickInFrame', 'waitForLoad', 'screenshot', 'networkResponseBody'])
+
+/** Used for both direct tools and sandbox dispatch. Internal CDP calls keep
+ * the outer operation's lease; they do not invent a different caller. */
+export function guardCdpOwnership<T extends object>(cdp: T, ownerId: string | undefined): T {
+  if (!ownerId) return cdp
+  return new Proxy(cdp, {
+    get(target, key, receiver) {
+      const value = Reflect.get(target, key, receiver)
+      if (typeof value !== 'function') return value
+      if (typeof key !== 'string' || !CDP_TAB_OPERATIONS.has(key)) return value.bind(target)
+      return async (...args: unknown[]) => {
+        const release = sharedSurfaceAssignments().beginUse(ownerId, [tabSurface(args[0] as number)])
+        try { return await Reflect.apply(value, target, args) } finally { release() }
+      }
+    },
+  })
 }
 
 export function createSurfaceAssignments(options?: SurfaceAssignmentsOptions): SurfaceAssignments {

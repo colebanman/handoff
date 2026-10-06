@@ -17,6 +17,8 @@ import {
 } from '../shared/browser-events'
 import { initBridge } from './bridge'
 import { initAgentHost } from './agent-host'
+import { initPanelView, openFullTab } from './panel-view'
+import { OPEN_FULL_TAB_MENU_ID } from '../shared/panel-view'
 import type { OffscreenRuntimeMessage } from '../shared/execution-protocol'
 
 const OFFSCREEN_PATH = 'offscreen.html'
@@ -31,6 +33,7 @@ chrome.sidePanel
 // CLI). Registers its own listeners synchronously at worker start-up, which is
 // what lets an alarm revive a terminated worker and redial the daemon.
 initBridge()
+initPanelView()
 
 /* ---- offscreen lifecycle ------------------------------------------------ */
 
@@ -76,6 +79,7 @@ function createMenuItem(options: chrome.contextMenus.CreateProperties): void {
 
 async function installContextMenus(): Promise<void> {
   await chrome.contextMenus.removeAll()
+  createMenuItem({ id: OPEN_FULL_TAB_MENU_ID, title: 'Open in full tab', contexts: ['action'] })
   const contexts: NonNullable<chrome.contextMenus.CreateProperties['contexts']> = [
     'selection',
     'link',
@@ -190,6 +194,10 @@ async function claimHandoffs(windowId?: number): Promise<BrowserHandoff[]> {
 }
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId === OPEN_FULL_TAB_MENU_ID) {
+    void openFullTab(tab?.windowId).catch((err) => console.error('[handoff] open full tab failed', err))
+    return
+  }
   if (info.menuItemId !== CONTEXT_MENU_ADD_ID && info.menuItemId !== CONTEXT_MENU_RESEARCH_ID) return
   const action = info.menuItemId === CONTEXT_MENU_RESEARCH_ID ? 'research-this' : 'add-to-chat'
   const context = contextFromClick(info, tab)
@@ -311,6 +319,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 /* ---- requests from extension pages ------------------------------------- */
 
 chrome.runtime.onMessage.addListener((raw: unknown, _sender, sendResponse) => {
+  // Memory inspection/mutations belong to extension pages, not content scripts on websites.
+  if ((raw as { type?: string })?.type === 'memory.command' && _sender.url && !_sender.url.startsWith(chrome.runtime.getURL(''))) return false
   const runtimeMessage = raw as Partial<OffscreenRuntimeMessage>
   if (runtimeMessage.target === 'background') {
     if (runtimeMessage.type === 'execution.keepalive') {

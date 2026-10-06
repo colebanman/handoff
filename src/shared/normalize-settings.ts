@@ -1,13 +1,18 @@
 import { DEFAULT_SETTINGS, type ActivityCursorMode, type ProviderKind, type Settings } from './types'
 import { BRIDGE_DEFAULT_PORT } from './bridge-protocol'
 
-const PROVIDERS = new Set<ProviderKind>(['gateway', 'openai', 'openai-compatible', 'xai', 'cerebras'])
+const PROVIDERS = new Set<ProviderKind>(['gateway', 'openai', 'openai-compatible', 'xai', 'cerebras', 'anthropic'])
 const ACTIVITY_CURSOR_MODES = new Set<ActivityCursorMode>(['off', 'actions', 'ambient'])
 export const DEFAULT_ACTIVITY_CURSOR: ActivityCursorMode = 'ambient'
 
 export function normalizeSettings(settings: Settings): Settings {
+  // Drop credentials left by older versions of the removed TypeSafe feature.
+  const cleaned = { ...settings } as Settings & { typeSafeEnabled?: boolean; typeSafeApiKey?: string }
+  delete cleaned.typeSafeEnabled
+  delete cleaned.typeSafeApiKey
   const modelId = settings.modelId.trim() || DEFAULT_SETTINGS.modelId
   const openaiAuthMode = settings.openaiAuthMode === 'chatgpt' ? 'chatgpt' : 'api-key'
+  const anthropicAuthMode = settings.anthropicAuthMode === 'api-key' ? 'api-key' : 'claude'
   const storedProvider = String(settings.provider)
   const providerWasRemoved = !PROVIDERS.has(storedProvider as ProviderKind)
   let provider: ProviderKind = providerWasRemoved ? DEFAULT_SETTINGS.provider : (storedProvider as ProviderKind)
@@ -22,7 +27,7 @@ export function normalizeSettings(settings: Settings): Settings {
       provider = 'xai'
       nextModelId = modelId.slice('xai/'.length)
     } else if (!modelId.includes('/')) {
-      nextModelId = modelId.startsWith('grok') ? `xai/${modelId}` : `openai/${modelId}`
+      nextModelId = modelId.startsWith('grok') ? `xai/${modelId}` : modelId.startsWith('claude-') ? `anthropic/${modelId}` : `openai/${modelId}`
     }
   } else if (provider === 'openai' || provider === 'openai-compatible') {
     nextModelId = modelId.startsWith('openai/') ? modelId.slice('openai/'.length) : modelId
@@ -30,6 +35,8 @@ export function normalizeSettings(settings: Settings): Settings {
     nextModelId = modelId.startsWith('xai/') ? modelId.slice('xai/'.length) : modelId
   } else if (provider === 'cerebras') {
     nextModelId = modelId.replace(/^cerebras\//, '')
+  } else if (provider === 'anthropic') {
+    nextModelId = modelId.replace(/^anthropic\//i, '')
   }
 
   // Key vault: `apiKeys` is the per-provider source of truth once present;
@@ -48,7 +55,9 @@ export function normalizeSettings(settings: Settings): Settings {
   // ChatGPT subscription requests use OAuth tokens from their dedicated store;
   // keep any existing OpenAI API key vaulted, but never expose it as the active
   // request credential while ChatGPT auth is selected.
-  const apiKey = provider === 'openai' && openaiAuthMode === 'chatgpt' ? '' : vaultedApiKey
+  const subscription = (provider === 'openai' && openaiAuthMode === 'chatgpt') ||
+    (provider === 'anthropic' && anthropicAuthMode === 'claude')
+  const apiKey = subscription ? '' : vaultedApiKey
 
   const customInstructions = settings.customInstructions?.trim() || undefined
 
@@ -66,9 +75,10 @@ export function normalizeSettings(settings: Settings): Settings {
   const activityCursor = activityCursorMode(settings)
 
   return {
-    ...settings,
+    ...cleaned,
     provider,
     openaiAuthMode,
+    anthropicAuthMode,
     modelId: nextModelId,
     apiKey,
     apiKeys,
@@ -76,8 +86,6 @@ export function normalizeSettings(settings: Settings): Settings {
     bridgeEnabled,
     bridgePort,
     activityCursor,
-    typeSafeEnabled: settings.typeSafeEnabled === true,
-    typeSafeApiKey: typeof settings.typeSafeApiKey === 'string' ? settings.typeSafeApiKey.trim() || undefined : undefined,
   }
 }
 

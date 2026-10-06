@@ -3,10 +3,13 @@ import { createAgentRuntime, type AgentRuntime } from '../agent'
 import { createCdpService } from '../cdp'
 import { applyEvent } from '../ui/reducer'
 import { isCompacting } from '../shared/compaction'
+import { applyContextUsage } from '../shared/context-usage'
 import { sanitizeModelMessages } from '../shared/model-messages'
 import { uid } from '../shared/ids'
 import { formatError } from '../shared/errors'
 import { debugLog } from '../shared/debug-log'
+import { redactSecrets } from '../shared/redact'
+import { toolResultError } from '../shared/tool-results'
 import { diagnosticOperations } from '../shared/runtime-diagnostics'
 import { abortable, throwIfAborted } from '../shared/abort'
 import { STEP_CHECKPOINT, type AgentEvent, type CdpService, type TaskInfo } from '../shared/types'
@@ -26,12 +29,14 @@ import { createStickyHost } from './sticky-host'
 import { createArtifactHost } from './artifact-host'
 import { createAutomationHost } from './automation-host'
 import { seedBundledSkills } from '../storage/seed-skills'
+import { createMemoryHost } from './memory-host'
+import { HARNESS_VERSION } from '../shared/harness-version'
 
 interface LiveExecution {
   snapshot: ExecutionSnapshot
   requestMessages: unknown[]
   controller: AbortController
-  steering: string[]
+  steering: Array<string | { text: string; browserContext?: import('../shared/browser-context').BrowserMessageContext }>
   persistTimer?: ReturnType<typeof setTimeout>
   persistQueue?: Promise<void>
 }
@@ -76,6 +81,7 @@ export async function getHostedSnapshots(): Promise<ExecutionSnapshot[]> {
   return loadSnapshots()
 }
 let runtime: AgentRuntime
+let memory: ReturnType<typeof createMemoryHost> | undefined
 let initialized: Promise<void> | undefined
 
 let ensureRuntime: () => Promise<void>
@@ -133,6 +139,8 @@ export function initAgentHost(ensureOffscreen: () => Promise<void>): {
   const automations = createAutomationHost({ startTurn: startHostedTurn, isChatRunning, onExecutionFinished })
   const extras = { artifacts, automations } as Parameters<typeof createBackgroundRuntimeServices>[2] & object
   const services = createBackgroundRuntimeServices(cdp, ensureOffscreen, extras)
+  memory = createMemoryHost({ vfs: services.vfs, busy: () => [...runs.values()].some((run) => run.snapshot.status === 'running' || run.snapshot.status === 'cancelling') ||
+    Boolean(runtime?.listTasks().some((task) => task.status === 'running' || task.status === 'cancelling')) })
   // Needs the VFS proxy the services expose, so it joins the dispatcher extras after construction.
   const stickies = createStickyHost(services.vfs)
   extras.stickies = stickies
@@ -140,6 +148,9 @@ export function initAgentHost(ensureOffscreen: () => Promise<void>): {
   runtime.onTaskUpdate((task) => handleTaskUpdate(task))
   const seeded = seedBundledSkills(services.vfs)
   initialized = hydrateExecutions()
+  // Committed execution records are the durable recovery outbox, including turns
+  // completed while the panel was closed. Journal ids make replay idempotent.
+  void initialized.then(async () => { for (const snapshot of await loadSnapshots()) memory?.committed(snapshot) }).catch(console.error)
   // Alarms survive restarts on their own; this re-arms drift, clears stale run
   // markers, and runs once whatever came due while the browser was closed.
   void Promise.all([seeded, initialized.then(() => automations.reconcile())]).catch((err) => console.error('[handoff] host startup', err))
@@ -160,7 +171,7 @@ export function initAgentHost(ensureOffscreen: () => Promise<void>): {
           operations: diagnosticOperations(),
         }))
       }
-      return services.handleMessage(message) ??
+      return memory?.handleRuntimeMessage(message as Parameters<NonNullable<typeof memory>['handleRuntimeMessage']>[0]) ?? services.handleMessage(message) ??
       artifacts.handleRuntimeMessage(message as Parameters<typeof artifacts.handleRuntimeMessage>[0]) ??
       automations.handleRuntimeMessage(message as Parameters<typeof automations.handleRuntimeMessage>[0]) ??
       stickies.handleRuntimeMessage(message as Parameters<typeof stickies.handleRuntimeMessage>[0])
@@ -216,7 +227,9 @@ async function handleClient(message: AgentHostClientMessage): Promise<void> {
   }
   if (message.type === 'steer') {
     const run = [...runs.values()].find((candidate) => candidate.snapshot.chatId === message.chatId)
-    if (run && run.snapshot.status === 'running' && !isCompacting(run.snapshot.record.transcript) && message.text.trim()) run.steering.push(message.text.trim())
+    if (run && run.snapshot.status === 'running' && !isCompacting(run.snapshot.record.transcript) && message.text.trim()) {
+      run.steering.push(message.browserContext ? { text: message.text.trim(), browserContext: message.browserContext } : message.text.trim())
+    }
     return
   }
   if (message.type === 'interaction-result') {
@@ -249,17 +262,20 @@ function startExecution(runId: string, options: SerializableRunOptions): void {
       startedAt: Date.now(),
       updatedAt: Date.now(),
       eventSeq: 0,
+      committedTranscriptLength: options.record.transcript.length,
     },
     controller,
     requestMessages: options.messages,
     steering: [],
   }
   runs.set(runId, run)
+  memory?.activity()
   executionEvents.set(options.chatId, [{ type: 'run-start', at: Date.now() }])
   if (executionEvents.size > 20) executionEvents.delete(executionEvents.keys().next().value!)
   checkpoint(run, true)
 
-  const onEvent = (event: AgentEvent): void => {
+  const onEvent = (incoming: AgentEvent): void => {
+    const event: AgentEvent = incoming.type === 'tool-call' ? { ...incoming, harnessVersion: HARNESS_VERSION } : incoming
     if (run.controller.signal.aborted || run.snapshot.status !== 'running') return
     const events = executionEvents.get(options.chatId) ?? []
     executionEvents.set(options.chatId, events)
@@ -267,17 +283,32 @@ function startExecution(runId: string, options: SerializableRunOptions): void {
     const toolId = 'toolCallId' in event ? event.toolCallId : undefined
     const previous = events.at(-1)
     const chars = 'delta' in event ? event.delta.length : undefined
+    const toolError = event.type === 'tool-result' ? toolResultError(event.output) : undefined
+    const toolFailure = event.type === 'tool-result' && (event.isError || toolError)
+      ? redactSecrets(`${event.toolName}: ${toolError?.message ?? (typeof event.output === 'string' ? event.output : 'Tool failed')}`).slice(0, 400)
+      : undefined
     if (chars !== undefined && previous?.type === event.type && previous.agentId === agentId && previous.toolId === toolId) {
       previous.at = Date.now(); previous.chars = (previous.chars ?? 0) + chars
     } else {
       events.push({ type: event.type, at: Date.now(), agentId, toolId, chars,
-        detail: event.type === 'rate-limit' ? `attempt=${event.attempt} retryIn=${event.retryInMs}ms ${event.message ?? ''}`
-          : event.type === 'agent-error' ? event.error : 'toolName' in event ? event.toolName : undefined })
+        detail: toolFailure ?? (event.type === 'rate-limit' ? `attempt=${event.attempt} retryIn=${event.retryInMs}ms ${event.message ?? ''}`
+          : event.type === 'agent-error' ? event.error : 'toolName' in event ? event.toolName : undefined) })
       if (events.length > 24) events.shift()
     }
     run.snapshot.eventSeq += 1
     run.snapshot.updatedAt = Date.now()
-    run.snapshot.record = { ...run.snapshot.record, transcript: applyEvent(run.snapshot.record.transcript, event), updatedAt: Date.now() }
+    if (event.type === 'rate-limit') {
+      run.snapshot.waits = { ...run.snapshot.waits, [event.agentId]: {
+        agentId: event.agentId, attempt: event.attempt, retryAt: Date.now() + event.retryInMs,
+        message: event.message, waitingForMain: event.waitingForMain, kind: event.kind, offline: event.offline,
+      } }
+    } else if (event.type === 'rate-limit-clear' && run.snapshot.waits?.[event.agentId]) {
+      const waits = { ...run.snapshot.waits }
+      delete waits[event.agentId]
+      run.snapshot.waits = waits
+    }
+    run.snapshot.record = { ...run.snapshot.record, transcript: applyEvent(run.snapshot.record.transcript, event),
+      contextUsage: applyContextUsage(run.snapshot.record.contextUsage, event), updatedAt: Date.now() }
     if (event.type === 'model-switch' && event.agentId === 'main') {
       run.snapshot.record.modelId = event.modelId
     }
@@ -299,6 +330,7 @@ function startExecution(runId: string, options: SerializableRunOptions): void {
     onStepMessages: (messages) => {
       if (controller.signal.aborted) return
       run.snapshot.record = { ...run.snapshot.record, messages: sanitizeModelMessages(messages) }
+      run.snapshot.committedTranscriptLength = run.snapshot.record.transcript.length
       checkpoint(run)
     },
     steering: { take: () => run.steering.splice(0), peek: () => run.steering.length > 0 },
@@ -361,6 +393,7 @@ function finishExecution(
   run.snapshot.result = result
   run.snapshot.error = error
   run.snapshot.interaction = undefined
+  run.snapshot.waits = undefined
   run.snapshot.updatedAt = Date.now()
   if (result && status === 'done') {
     run.snapshot.record = {
@@ -385,6 +418,8 @@ function finishExecution(
 
 function handleTaskUpdate(task: TaskInfo): void {
   broadcast({ type: 'task', task })
+  memory?.taskFinished(task)
+  memory?.activity()
   const active = task.status === 'running' || task.status === 'cancelling'
   void setActivity(`task:${task.id}`, active).catch(console.error)
   if (!task.chatId) return
@@ -410,6 +445,7 @@ function checkpoint(run: LiveExecution, immediate = false): void {
     }
     run.persistQueue = (run.persistQueue ?? Promise.resolve()).then(async () => {
       await chrome.storage.local.set({ [keyOf(snapshot.runId)]: snapshot })
+      memory?.committed(snapshot)
       broadcast({ type: 'snapshot', snapshot })
     }).catch(console.error)
   }

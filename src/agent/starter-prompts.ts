@@ -20,7 +20,7 @@ import { debugLog } from '../shared/debug-log'
 import { redactSecrets } from '../shared/redact'
 import { resolveModel, resolveModelAccess } from './models'
 import { collectOnboardingSignals, LUNA_MODEL_ID } from './onboarding-luna'
-import { readMemory, serializeMemoryForPrompt } from './memory'
+import { personalizationMemory } from './continuity-personalization'
 
 /** Shorter than the onboarding pass: this runs on a click, not behind a wizard. */
 const TIMEOUT_MS = 25_000
@@ -100,10 +100,7 @@ async function attempt(deps: StarterPromptsInput, signal: AbortSignal): Promise<
   ])
   if (signal.aborted || digest.length < 200) return []
 
-  // The cheap personalization model gets the complete bounded memory snapshot.
-  // The main agent still sees titles only; this broader context is specifically
-  // useful here because a blank chat has no conversation to resolve shorthand.
-  const memory = serializeMemoryForPrompt(await readMemory(deps.vfs))
+  const memory = await personalizationMemory(deps.vfs, `${recentActivity}\n${digest}`)
   if (signal.aborted) return []
 
   const model = resolveModel(access.settings, access.chatgptCredentials)

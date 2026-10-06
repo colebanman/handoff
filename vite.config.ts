@@ -3,6 +3,8 @@ import react from '@vitejs/plugin-react'
 import { build as bundleContentScript } from 'esbuild'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 
 // Chrome MV3 multi-entry build:
 //  - sidepanel.html  -> chat UI (React)
@@ -19,11 +21,14 @@ import { resolve } from 'node:path'
 // gives it its own extension id, so its storage is fully isolated from the
 // primary install — the rename is only to tell the two apart in the UI.
 
-// tsconfig pins `types` to chrome + vite/client; declare the build environment.
+// tsconfig pins `types` to chrome + vite/client and @types/node is not a
+// dependency, so name the single Node global this config reads.
 declare const process: { env: Record<string, string | undefined> }
 
 const devBuild = process.env.HANDOFF_DEV === '1'
-const buildDefines = { __DEV_BUILD__: JSON.stringify(devBuild) }
+const contractHash = createHash('sha256')
+for (const path of ['src/agent/tools.ts', 'src/shared/rpc.ts', 'src/sandbox/api-dispatch.ts', 'src/cdp/service.ts', 'src/shared/extensions.ts']) contractHash.update(readFileSync(path))
+const buildDefines = { __DEV_BUILD__: JSON.stringify(devBuild), __HARNESS_VERSION__: JSON.stringify(contractHash.digest('hex').slice(0, 16)) }
 
 export default defineConfig({
   plugins: [react(), {
@@ -48,7 +53,8 @@ export default defineConfig({
   // substitutes `false`, and Rollup then deletes the guarded branches outright.
   // A production bundle therefore has no reachable path that wipes storage.
   define: buildDefines,
-  // Run the extension and bridge regression suites.
+  // `context/` contains nested reference checkouts with their own dependency
+  // graphs and tests. Exercise this extension, not those vendored suites.
   test: { include: ['src/**/*.test.ts', 'bridge/test/**/*.test.mjs'] },
   build: {
     outDir: 'dist',
@@ -63,7 +69,7 @@ export default defineConfig({
         artifactFrame: 'artifact-frame.html',
         sandbox: 'sandbox.html',
         // The inspector exposes raw provider traffic and implementation details.
-        // Do not ship its page or entry chunk in production builds.
+        // Do not ship its page or entry chunk in normal/share builds.
         ...(devBuild ? { streamDebug: 'stream-debug.html' } : {}),
         offscreen: 'offscreen.html',
         background: 'src/background/index.ts',

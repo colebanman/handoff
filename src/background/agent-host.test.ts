@@ -7,6 +7,7 @@ vi.mock('../agent', () => ({ createAgentRuntime: () => ({ ...fake, onTaskUpdate:
 vi.mock('../cdp', () => ({ createCdpService: () => ({}) }))
 vi.mock('./runtime-services', () => ({ createBackgroundRuntimeServices: () => ({ vfs: {}, sandbox: {} }) }))
 vi.mock('../storage/seed-skills', () => ({ seedBundledSkills: async () => {} }))
+vi.mock('./memory-host', () => ({ createMemoryHost: () => ({ committed: vi.fn(), taskFinished: vi.fn(), activity: vi.fn(), handleRuntimeMessage: () => undefined }) }))
 vi.mock('./automation-host', () => ({
   createAutomationHost: () => ({ reconcile: async () => {}, handleRuntimeMessage: () => undefined }),
 }))
@@ -75,12 +76,49 @@ it('exports background agent failures for the panel debug button', async () => {
   expect(report).toContain('Failed to fetch')
 })
 
+it('exports a bounded, redacted reason for tool-result failures', async () => {
+  const owner = panel()
+  owner.send(start)
+  await flush()
+  const options = fake.runTurn.mock.calls[0]![0] as RunTurnOptions
+  const token = 'abcdefghij0123456789abcdefghij'
+  options.onEvent({
+    type: 'tool-result', agentId: 'main', toolCallId: 'spawn', toolName: 'subagent_spawn',
+    output: `Error: tab 7 is already assigned. Bearer ${token}`, isError: true, durationMs: 1,
+  })
+  const report = await host.handleRuntimeMessage({ target: 'background', type: 'execution.debug', chatId: 'chat-1' })
+  expect(report).toContain('subagent_spawn: tab 7 is already assigned.')
+  expect(report).not.toContain(token)
+  expect(report).toContain('redacted:bearer-token')
+})
+
 it('opens an idle panel without reading unrelated chat histories', async () => {
   saved['chat:large-archive'] = { messages: ['large archived content'] }
   const owner = panel()
   await flush()
   expect(owner.posted).toContainEqual({ type: 'ready', executions: [], tasks: [] })
   expect(chrome.storage.local.get).not.toHaveBeenCalled()
+})
+
+it('preserves the last measured context across panel closure and ignores aggregate billing usage', async () => {
+  const owner = panel()
+  owner.send(start)
+  await flush()
+  const options = fake.runTurn.mock.calls[0]![0] as RunTurnOptions
+  const context = { model: { provider: 'anthropic' as const, modelId: 'claude-sonnet-5-5' },
+    inputTokens: 12_000, cachedInputTokens: 10_000, window: { tokens: 1_000_000, source: 'model' as const } }
+  options.onEvent({ type: 'usage-update', agentId: 'main', modelId: context.model.modelId,
+    usage: { inputTokens: 12_000, outputTokens: 500, totalTokens: 12_500 }, context })
+  options.onEvent({ type: 'usage-update', agentId: 'sub-1', modelId: 'gpt-6.1-sol', usage: { inputTokens: 99_000 } })
+  options.onEvent({ type: 'usage-update', agentId: 'main', modelId: context.model.modelId, usage: {} })
+  owner.close()
+  resolveTurn({ text: 'Done', responseMessages: [], usage: { inputTokens: 200_000, totalTokens: 210_000 } })
+  await flush()
+  const observer = panel()
+  await flush()
+  const restored = observer.posted.find((message) => message.type === 'ready')?.executions[0]
+  expect(restored.record.contextUsage).toMatchObject({ modelId: context.model.modelId, context })
+  expect(restored.record.contextUsage.usage.inputTokens).toBe(12_000)
 })
 
 it('loads only pending checkpoints when attaching a panel', async () => {
@@ -136,6 +174,25 @@ it('checkpoints a continuous stream and reattaches with the latest in-memory sta
   expect((saved[`${EXECUTION_KEY_PREFIX}run-1`] as ExecutionSnapshot).status).toBe('done')
   await vi.advanceTimersByTimeAsync(250)
   expect((saved[`${EXECUTION_KEY_PREFIX}run-1`] as ExecutionSnapshot).status).toBe('done')
+})
+
+it('persists connection waits and the last completed-step boundary', async () => {
+  const owner = panel()
+  owner.send(start)
+  await flush()
+  const turn = fake.runTurn.mock.calls[0]![0] as RunTurnOptions
+  turn.onEvent({ type: 'rate-limit', agentId: 'main', attempt: 1, retryInMs: 1000,
+    kind: 'connection', offline: true })
+  turn.onEvent({ type: 'text-start', agentId: 'main', id: 'partial' })
+  turn.onStepMessages?.([{ role: 'user', content: 'Task' }, { role: 'assistant', content: 'Done step' }])
+  await vi.advanceTimersByTimeAsync(250)
+  const waiting = saved[`${EXECUTION_KEY_PREFIX}run-1`] as ExecutionSnapshot
+  expect(waiting.waits?.main).toMatchObject({ kind: 'connection', offline: true, attempt: 1 })
+  expect(waiting.committedTranscriptLength).toBe(1)
+  expect(waiting.record.messages).toHaveLength(2)
+  turn.onEvent({ type: 'rate-limit-clear', agentId: 'main' })
+  await vi.advanceTimersByTimeAsync(250)
+  expect((saved[`${EXECUTION_KEY_PREFIX}run-1`] as ExecutionSnapshot).waits).toEqual({})
 })
 
 it('releases a cancelled chat even when its command never settles, and ignores late events', async () => {

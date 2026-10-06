@@ -38,6 +38,14 @@ afterEach(() => {
 })
 
 describe('durable execution client reattachment', () => {
+  it('forwards captured browser context with steering without changing user text', () => {
+    const port = new FakePort()
+    vi.stubGlobal('chrome', { runtime: { connect: () => port } })
+    const client = createAgentClient()
+    const browserContext = { text: '<context>Active tab: [42]</context>', tabId: 42 }
+    client.executions.steer('chat-1', 'Use this page instead', browserContext)
+    expect(port.sent).toContainEqual({ type: 'steer', chatId: 'chat-1', text: 'Use this page instead', browserContext })
+  })
   it('cancels before ready without starting the turn later', async () => {
     const port = new FakePort()
     vi.stubGlobal('chrome', { runtime: { connect: () => port } })
@@ -140,6 +148,26 @@ describe('durable execution client reattachment', () => {
     expect(client.executions.list()[0]?.status).toBe('done')
     await client.executions.acknowledge(start.runId)
     expect(chrome.storage.local.remove).toHaveBeenCalledWith(`agent-execution:${start.runId}`)
+  })
+
+  it('delivers a saved interruption after the worker restarts', async () => {
+    vi.useFakeTimers()
+    const ports: FakePort[] = []
+    vi.stubGlobal('chrome', { runtime: { connect: () => { const port = new FakePort(); ports.push(port); return port } } })
+    const client = createAgentClient()
+    ports[0]!.receive({ type: 'ready', executions: [], tasks: [] })
+    const result = client.agent.runTurn({ chatId: 'chat-1', messages: record().messages,
+      settings: DEFAULT_SETTINGS, lifecycleRecord: record(), signal: new AbortController().signal, onEvent: vi.fn() })
+    const rejected = expect(result).rejects.toThrow('service worker was terminated')
+    await vi.advanceTimersByTimeAsync(0)
+    const start = ports[0]!.sent.find((message) => (message as { type?: string }).type === 'start') as { runId: string }
+    ports[0]!.receive({ type: 'snapshot', snapshot: { ...snapshot('running'), runId: start.runId } })
+    ports[0]!.disconnect()
+    await vi.advanceTimersByTimeAsync(500)
+    ports[1]!.receive({ type: 'ready', executions: [{ ...snapshot('interrupted'), runId: start.runId,
+      committedTranscriptLength: 0, error: 'The service worker was terminated during this turn.' }], tasks: [] })
+    await rejected
+    expect(client.executions.list()[0]).toMatchObject({ status: 'interrupted', committedTranscriptLength: 0 })
   })
 
   it('ignores an older disk checkpoint arriving after the live reconnect snapshot', () => {

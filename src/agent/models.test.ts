@@ -13,6 +13,38 @@ const signedOut = async (): Promise<never> => {
 }
 
 describe('model access fallback', () => {
+  it.each(['claude-opus-5-5', 'claude-sonnet-5-5'])('uses Claude subscription for %s without activating an API key', async (modelId) => {
+    const settings: Settings = { ...DEFAULT_SETTINGS, provider: 'anthropic', anthropicAuthMode: 'claude',
+      modelId, apiKey: '', apiKeys: { anthropic: 'paid-key', openai: 'other-paid-key' } }
+    const credentials = { accessToken: 'test-token' }
+    const access = await resolveModelAccess(settings, modelId, signedOut, async () => credentials)
+    expect(access.settings).toMatchObject({ provider: 'anthropic', modelId, apiKey: '' })
+    expect(access.claudeCredentials).toEqual(credentials)
+    expect(hasModelAccess(settings, modelId, false, true)).toBe(true)
+    expect(hasModelAccess(settings, modelId, true, false)).toBe(false)
+  })
+
+  it('does not fall back to a paid key when Claude subscription login fails', async () => {
+    const settings: Settings = { ...DEFAULT_SETTINGS, provider: 'anthropic', anthropicAuthMode: 'claude',
+      modelId: 'claude-opus-5-5', apiKeys: { anthropic: 'paid-key', xai: 'paid-key' } }
+    await expect(resolveModelAccess(settings, settings.modelId, signedOut, async () => {
+      throw new Error('Claude session expired')
+    })).rejects.toThrow('Claude session expired')
+  })
+
+  it('routes helpers through the active Claude subscription when OpenAI is unavailable', async () => {
+    const settings: Settings = { ...DEFAULT_SETTINGS, provider: 'anthropic', anthropicAuthMode: 'claude',
+      modelId: 'claude-sonnet-5-5', apiKey: '', openaiAuthMode: 'chatgpt' }
+    const access = await resolveModelAccess(settings, 'gpt-6-luna', signedOut, async () => ({ accessToken: 'token' }))
+    expect(access.settings).toMatchObject({ provider: 'anthropic', modelId: 'claude-sonnet-5-5', apiKey: '' })
+    expect(hasModelAccess(settings, 'gpt-6-luna', false, true)).toBe(true)
+  })
+
+  it('prefixes bare Claude ids correctly through a configured gateway', () => {
+    expect(resolveProviderSettings({ ...DEFAULT_SETTINGS, provider: 'gateway', apiKey: 'gateway' }, 'claude-opus-5-5'))
+      .toMatchObject({ provider: 'gateway', modelId: 'anthropic/claude-opus-5-5', apiKey: 'gateway' })
+  })
+
   it('uses a saved OpenAI API key when ChatGPT is selected but signed out', async () => {
     const settings: Settings = {
       ...DEFAULT_SETTINGS,
@@ -158,6 +190,18 @@ describe('locally served curated model', () => {
     const resolved = resolveProviderSettings(onLocal, 'gpt-5.6-sol')
     expect(resolved.provider).toBe('openai')
     expect(resolved.apiKey).toBe('sk-platform')
+  })
+
+  it.each(['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'])('routes %s to OpenAI with its saved key', (modelId) => {
+    const settings: Settings = {
+      ...DEFAULT_SETTINGS,
+      provider: 'xai',
+      apiKey: 'xai-key',
+      apiKeys: { openai: 'sk-platform', xai: 'xai-key' },
+    }
+    expect(resolveProviderSettings(settings, modelId)).toMatchObject({
+      provider: 'openai', modelId, apiKey: 'sk-platform',
+    })
   })
 
   it('still lets a free-text id ride a user-configured proxy', () => {

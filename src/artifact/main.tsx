@@ -1,7 +1,7 @@
 import { StrictMode, useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
+import { MARKDOWN_REMARK_PLUGINS, MARKDOWN_REHYPE_PLUGINS } from '../ui/markdown-plugins'
 import {
   artifactEmbedFromLocation,
   artifactNameFromPath,
@@ -394,7 +394,7 @@ function renderArtifact(state: ArtifactState): React.ReactElement {
   if (state.markdown) {
     return (
       <article className="artifact-markdown">
-        <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: ArtifactLink }}>{state.text}</ReactMarkdown>
+        <ReactMarkdown remarkPlugins={MARKDOWN_REMARK_PLUGINS} rehypePlugins={MARKDOWN_REHYPE_PLUGINS} components={{ a: ArtifactLink }}>{state.text}</ReactMarkdown>
       </article>
     )
   }

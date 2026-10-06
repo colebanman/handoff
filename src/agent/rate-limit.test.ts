@@ -28,7 +28,7 @@ async function readParts(stream: ReadableStream<Part>) {
     reader.releaseLock()
   }
 }
-afterEach(() => vi.useRealTimers())
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
 
 describe('model request transport recovery', () => {
   it('recognizes Chrome fetch errors nested in provider errors', () => {
@@ -79,13 +79,39 @@ describe('model request transport recovery', () => {
     expect(JSON.stringify(model.doStreamCalls[2]!.prompt)).toContain('saved notes')
   })
 
-  it('stops after two transport retries', async () => {
+  it('stops after six visible transport retries', async () => {
     vi.useFakeTimers()
+    const onConnectionWait = vi.fn()
+    const onConnectionClear = vi.fn()
     const model = new MockLanguageModelV3({ doStream: async () => { throw new TypeError('Failed to fetch') } })
-    const rejected = expect(collect(model)).rejects.toThrow('Failed to fetch')
+    const wrapped = withRateLimitRetry(model, { onConnectionWait, onConnectionClear }) as MockLanguageModelV3
+    const rejected = expect(wrapped.doStream({ prompt: [] })).rejects.toThrow('Failed to fetch')
     await vi.runAllTimersAsync()
     await rejected
-    expect(model.doStreamCalls).toHaveLength(3)
+    expect(model.doStreamCalls).toHaveLength(7)
+    expect(onConnectionWait).toHaveBeenCalledTimes(6)
+    expect(onConnectionClear).toHaveBeenCalledOnce()
+  })
+
+  it('waits for a reported offline connection before retrying', async () => {
+    vi.useFakeTimers()
+    const network = { onLine: false }
+    vi.stubGlobal('navigator', network)
+    let calls = 0
+    const onConnectionWait = vi.fn()
+    const model = new MockLanguageModelV3({ doStream: async () => {
+      if (++calls === 1) throw new TypeError('Failed to fetch')
+      return response(answer)
+    } })
+    const wrapped = withRateLimitRetry(model, { onConnectionWait }) as MockLanguageModelV3
+    const result = wrapped.doStream({ prompt: [] }).then(({ stream }) => readParts(stream))
+    await vi.advanceTimersByTimeAsync(4000)
+    expect(calls).toBe(1)
+    expect(onConnectionWait).toHaveBeenCalledWith(expect.objectContaining({ offline: true }))
+    network.onLine = true
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(await result).toEqual(answer)
+    expect(calls).toBe(2)
   })
 
   it('recovers a connection that closes after metadata without producing output', async () => {

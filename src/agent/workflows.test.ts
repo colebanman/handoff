@@ -143,6 +143,13 @@ return await agent('Synthesize this evidence: ' + research);`,
 })
 
 describe('workflow coordinator', () => {
+  it.each(['Error: tab 123 does not exist', 'Error: tab 7 is already assigned to sub-other'])('returns null for a launch failure: %s', async error => {
+    const { run, events } = coordinator(async () => error)
+    const report = await run({ title: 'Review', description: 'Read a page', script: 'return await agent("Read", {tabIds:[123]});', parentToolCallId: 'test' })
+    expect(report).toContain('Result:\nnull')
+    const registered = events.find(event => event.type === 'workflow-agent-register')
+    expect(registered?.type === 'workflow-agent-register' && registered.agent.status).toBe('error')
+  })
   it('persists inline source and converts a failed child to null', async () => {
     const spawn = vi.fn<SpawnSubagentFn>(async ({ task }) =>
       task === 'fail' ? 'Error: subagent failed — expected failure' : 'usable result',

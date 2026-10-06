@@ -298,7 +298,7 @@ function forwardToPanel(req: BridgeRequestFrame): Promise<unknown> {
     notifyPanelClosed(req)
     throw new BridgeError(
       'panel_closed',
-      "Handoff's side panel is closed, so this bridge request cannot be accepted. Ask the user to open the Handoff side panel in Chrome, then retry.",
+      "Handoff's side panel is closed, so there is no runtime to serve this. Ask the user to open the Handoff side panel in Chrome, then retry.",
     )
   }
   return new Promise<unknown>((resolve, reject) => {
@@ -318,8 +318,8 @@ function forwardToPanel(req: BridgeRequestFrame): Promise<unknown> {
 }
 
 /**
- * New bridge work is accepted through the panel, so a request that lands
- * while it is closed cannot be accepted. Chrome forbids opening the side panel
+ * The panel is the only thing that can run a turn, so a request that lands
+ * while it is closed is a dead end. Chrome forbids opening the side panel
  * without a user gesture, so the best we can do is ask — a notification plus a
  * badge on the toolbar icon.
  */

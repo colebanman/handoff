@@ -9,11 +9,10 @@ import { sliceWellFormed, toWellFormed } from '../shared/text'
 import { contextText, isRuntimeContextText, RUNTIME_CONTEXT_START } from '../shared/context-blocks'
 import { redactSecrets } from '../shared/redact'
 import { debugLog } from '../shared/debug-log'
-import type { TypeSafeSession, RelevanceCandidate } from './typesafe'
-import { matchesTask, supportsUrl } from '../shared/extension-matching'
 import { readStickies, renderStickiesSection, stickyContext, type DeliveredSticky } from './stickies-context'
 import { scanDeliveredStickies } from '../shared/stickies'
 import { MEMORY_PATH, memoryIndexLines, readMemory } from './memory'
+import { ContinuityDelivery, memoryRuntime } from './continuity-context'
 import {
   SITE_MEMORY_PATH, SITE_MEMORY_MAX_MATCHES, matchSiteMemories, normalizeUrlForScope,
   readSiteMemory, renderSiteMemories, scopeMatches, scopeSpecificity, siteGuideMatchesTask, type SiteMemoryIndexEntry,
@@ -30,6 +29,9 @@ export interface RuntimeContextOptions {
   pendingTasks?: TaskInfo[]
   /** Main agent: the chat this turn belongs to (sticky edits made from it are not re-announced). */
   chatId?: string
+  modelId?: string
+  /** URLs bound at an actual tool-step observation, rather than ambient open tabs. */
+  memoryUrls?: string[]
 }
 
 export function messageText(message: ModelMessage): string {
@@ -91,14 +93,11 @@ export function selectSiteMemories(
   return [...selected.values()].sort((a, b) => score(b) - score(a) || entries.indexOf(a) - entries.indexOf(b))
 }
 
-export function workspaceContext(files: VfsEntry[], skills: VfsSkillMetadata[], scores?: Map<string, number>, task = ''): string {
+export function workspaceContext(files: VfsEntry[], skills: VfsSkillMetadata[]): string {
   const listed = files.filter((file) => file.root === 'workspace' && file.path !== MEMORY_PATH && file.path !== SITE_MEMORY_PATH && !file.path.startsWith('/workspace/.tool-output/'))
     .sort((a, b) => a.path.localeCompare(b.path))
-  const explicit = (skill: VfsSkillMetadata) => matchesTask(skill.name, task) || task.includes(skill.path)
-  const sortedSkills = [...skills].sort((a, b) => scores
-    ? Number(explicit(b)) - Number(explicit(a)) || (scores.get(b.path) ?? 0) - (scores.get(a.path) ?? 0) || a.path.localeCompare(b.path)
-    : a.path.localeCompare(b.path))
-  const limit = scores ? Math.max(12, skills.filter(explicit).length) : 40
+  const sortedSkills = [...skills].sort((a, b) => a.path.localeCompare(b.path))
+  const limit = 40
   const fileLines = listed.slice(0, 50).map((file) =>
     `- ${contextText(file.path)} (${contextText(file.mediaType)}, ${file.size} bytes; updated ${file.updatedAt})`)
   if (listed.length > 50) fileLines.push(`- ${listed.length - 50} more; api.fs.list('/workspace') for all.`)
@@ -110,9 +109,14 @@ export function workspaceContext(files: VfsEntry[], skills: VfsSkillMetadata[], 
 
 /** Compare against the last delivered section, including on resumed/persisted chats. */
 export class RuntimeContextDelivery {
+  private readonly continuity = new ContinuityDelivery()
   private readonly delivered = new Map<string, string>()
   extensionBlock: string | undefined
   extensionRevisions: Record<string, number> = {}
+
+  projectMemory<T extends { role?: unknown; content?: unknown }>(history: T[]): T[] {
+    return memoryRuntime() ? this.continuity.project(history) : history
+  }
 
   restoreExtensions(messages: ModelMessage[]): ModelMessage[] {
     return reconcileReplContext(messages, this.extensionBlock, (content) => ({ role: 'user', content }))
@@ -122,7 +126,7 @@ export class RuntimeContextDelivery {
   /** Sticky revision the model last saw in this chat, per sticky id. */
   private stickies = new Map<string, DeliveredSticky>()
 
-  constructor(history: ModelMessage[], private readonly typeSafe?: TypeSafeSession) {
+  constructor(history: ModelMessage[]) {
     this.syncBoundary(history)
   }
 
@@ -139,7 +143,7 @@ export class RuntimeContextDelivery {
       if (message.role !== 'user') continue
       const text = messageText(message)
       if (!isRuntimeContextText(text)) continue
-      for (const tag of ['workspace', 'user-memory', 'site-memory', 'active-task', 'repl-extensions']) {
+      for (const tag of ['workspace', 'user-memory', 'site-memory', 'active-task', 'repl-extensions', 'browser-target']) {
         const block = new RegExp(`<${tag}>[\\s\\S]*?<\\/${tag}>`).exec(text)?.[0]
         if (block) this.delivered.set(tag, block)
       }
@@ -151,25 +155,31 @@ export class RuntimeContextDelivery {
     vfs: VirtualFileSystemService, messages: ModelMessage[], tabs: ContextTab[], options: RuntimeContextOptions,
   ): Promise<ModelMessage | undefined> {
     this.syncBoundary(messages)
+    const managedMemory = memoryRuntime()
     const [filesystem, memory, sites, extensions, extensionSettings] = await Promise.all([
-      vfs.summary(), options.isSubagent ? Promise.resolve([]) : readMemory(vfs),
-      options.offlineOnly ? Promise.resolve([]) : readSiteMemory(vfs),
+      vfs.summary(), options.isSubagent || managedMemory ? Promise.resolve([]) : readMemory(vfs),
+      options.offlineOnly || managedMemory ? Promise.resolve([]) : readSiteMemory(vfs),
       vfs.extensions ? vfs.extensions('list').catch(() => []) as Promise<ExtensionSummary[]> : Promise.resolve([]),
       vfs.extensions ? vfs.extensions('settings').catch(() => ({ learningEnabled: true })) as Promise<{ learningEnabled: boolean }> : Promise.resolve({ learningEnabled: true }),
     ])
     const permittedTabs = options.offlineOnly ? [] : tabs.filter((t) => !options.isSubagent || options.allowedTabIds?.includes(t.id!))
     const task = latestTaskText(messages)
-    const skills = filesystem.skills.filter((skill) => !extensions.some((e) => skill.path.startsWith(`${e.path}/`)))
-    const candidates: RelevanceCandidate[] = skills.map((s) => ({ id: s.path, description: `${s.name}: ${s.description}` }))
-    for (const entry of extensions.filter((e) => e.enabled)) {
-      for (const [path, action] of Object.entries(entry.manifest.actions)) {
-        if (action.effects !== 'local' && !permittedTabs.some((t) => supportsUrl(entry.manifest, t.url ?? t.pendingUrl ?? ''))) continue
-        candidates.push({ id: `${entry.id}.${path}@${entry.revision}`, description: `${entry.description}: ${path} — ${action.description}` })
+    if (managedMemory) {
+      const urls = options.offlineOnly ? [] : options.memoryUrls ?? permittedTabs.filter((t) => t.id === options.currentTabId || (options.isSubagent && options.allowedTabIds?.includes(t.id!))).flatMap((t) => t.url ? [t.url] : [])
+      if (!options.isSubagent) {
+        urls.push(...[...task.matchAll(/https?:\/\/[^\s<>"']+/g)].map((m) => m[0].replace(/[),.;\]]+$/, '')))
+        for (const match of task.matchAll(/@tab\((\d+)\b/g)) {
+          const tab = tabs.find((t) => t.id === Number(match[1]))
+          if (tab?.url) urls.push(tab.url)
+        }
       }
+      this.continuity.prepare(managedMemory.snapshot(), { task, urls: [...new Set(urls)], chatId: options.chatId, isSubagent: options.isSubagent,
+        guides: new Map(filesystem.entries.map((file) => [file.path, { updatedAt: file.updatedAt, size: file.size }])),
+      }, managedMemory.recent(), options.modelId ?? '')
     }
-    const scores = await this.typeSafe?.rank(task, candidates)
+    const skills = filesystem.skills.filter((skill) => !extensions.some((e) => skill.path.startsWith(`${e.path}/`)))
     const sensed = await observeExtensionContext(extensions, permittedTabs)
-    const extensionDocs = extensionContext(extensions, task, tabs, options, sensed, extensionSettings.learningEnabled, scores)
+    const extensionDocs = extensionContext(extensions, task, tabs, options, sensed, extensionSettings.learningEnabled)
     this.extensionRevisions = extensionDocs.revisions
     this.extensionBlock = extensionDocs.block || ((this.delivered.has('repl-extensions') || this.extensionBlock)
       ? '<repl-extensions>\nNo saved extensions are available. Earlier inventories are superseded.\n</repl-extensions>' : undefined)
@@ -180,14 +190,15 @@ export class RuntimeContextDelivery {
       return `<guide-file path="${contextText(path)}" state="${entry ? 'available' : 'missing'}"${entry ? ` updated="${entry.updatedAt}" size="${entry.size}"` : ''} />`
     }))
     const sections = new Map<string, string>([
-      ['workspace', workspaceContext(filesystem.entries, skills, scores, task)],
-      ['site-memory', `<site-memory>\n${selected.length ? 'Saved guidance for the task and selected pages. Apply each entry only within its scopes. Updated entries supersede earlier versions; re-read a guide if its file changed.\n' + renderSiteMemories(selected) + '\n' + guideVersions.join('\n') : 'No site memories apply to the current task and selected pages. Earlier site-specific guidance remains scoped to its original pages.'}\n</site-memory>`],
+      ['workspace', workspaceContext(filesystem.entries, skills)],
+      ...(!managedMemory ? [['site-memory', `<site-memory>\n${selected.length ? 'Saved guidance for the task and selected pages. Apply each entry only within its scopes. Updated entries supersede earlier versions; re-read a guide if its file changed.\n' + renderSiteMemories(selected) + '\n' + guideVersions.join('\n') : 'No site memories apply to the current task and selected pages. Earlier site-specific guidance remains scoped to its original pages.'}\n</site-memory>`] as [string, string]] : []),
     ])
+    if (!options.offlineOnly) sections.set('browser-target', `<browser-target>\nBrowser tools with an omitted tabId use working tab ${options.currentTabId}. The active tab attached to a user message identifies their page context; pass tabId explicitly or snapshot that tab to switch your working target.\n</browser-target>`)
     if (this.extensionBlock) sections.set('repl-extensions', this.extensionBlock)
     const revision = options.isSubagent ? '' : Array.from(new Uint8Array(await crypto.subtle.digest(
       'SHA-256', new TextEncoder().encode(JSON.stringify(memory)),
     ))).map((byte) => byte.toString(16).padStart(2, '0')).join('').slice(0, 16)
-    if (!options.isSubagent) sections.set('user-memory', `<user-memory>\nIndex of ${MEMORY_PATH} (revision ${revision}); read relevant entries with api.fs.readLines. This replaces earlier indexes; re-read relevant entries if the revision changed.\n${memoryIndexLines(memory).map(contextText).join('\n') || '- none'}\n</user-memory>`)
+    if (!options.isSubagent && !managedMemory) sections.set('user-memory', `<user-memory>\nIndex of ${MEMORY_PATH} (revision ${revision}); read relevant entries with api.fs.readLines. This replaces earlier indexes; re-read relevant entries if the revision changed.\n${memoryIndexLines(memory).map(contextText).join('\n') || '- none'}\n</user-memory>`)
     if (this.compacted && !this.delivered.has('active-task')) {
       const recent = messages.filter((message) => message.role === 'user' && !isCompactionCheckpoint(message) &&
         !isRuntimeContextText(messageText(message)) && messageText(message).trim()).slice(-3)
@@ -211,6 +222,10 @@ export class RuntimeContextDelivery {
       }
     }
     const changed: string[] = []
+    if (managedMemory) {
+      const continuity = this.continuity.next(this.continuity.project(messages))
+      if (continuity) changed.push(continuity)
+    }
     for (const [tag, raw] of sections) {
       const block = redactSecrets(raw)
       if (this.delivered.get(tag) === block) continue
@@ -218,6 +233,8 @@ export class RuntimeContextDelivery {
       this.delivered.set(tag, block)
     }
     if (!changed.length) return undefined
-    return { role: 'user', content: `${RUNTIME_CONTEXT_START}${changed.join('\n\n')}\n</context>` }
+    return { role: 'user', content: `${RUNTIME_CONTEXT_START}${changed.join('\n\n')}\n</context>`,
+      ...(!options.offlineOnly ? { providerOptions: { harness: { workingTabId: options.currentTabId } } } : {}),
+    }
   }
 }

@@ -1,13 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { buildTools, type BuildToolsArgs } from './tools'
+import type { FormField } from '../shared/form-fill'
 
 function harness() {
   const controller = new AbortController()
   const cdp = {
-    type: vi.fn().mockResolvedValue(undefined),
+    fill: vi.fn(async (_id, fields: FormField[]) => ({ ok: true, fields: fields.map(({ ref }) => ({ ref, status: 'verified' })) })),
     waitForLoad: vi.fn().mockResolvedValue(true),
-    snapshot: vi.fn().mockResolvedValue({ tabId: 7, title: 'Form', url: 'https://example.test', text: '[e1] textbox Name: Alice\n[e2] textbox City: Boston' }),
+    snapshot: vi.fn().mockResolvedValue({ tabId: 7, title: 'Form', url: 'https://example.test', text: 'Form values' }),
   }
   const tools = buildTools({
     cdp: cdp as unknown as BuildToolsArgs['cdp'],
@@ -16,7 +17,7 @@ function harness() {
     emit: vi.fn(), spawnSubagent: vi.fn(), tasks: {} as BuildToolsArgs['tasks'],
     signal: controller.signal, sandboxSessionId: 'form-test',
   })
-  const run = (fields = [{ ref: 'e1', text: 'Alice' }, { ref: 'e2', text: 'Boston' }], tabId = 7) =>
+  const run = (fields: FormField[] = [{ ref: 'e1', text: 'Alice' }, { ref: 'e2', select: 'No' }], tabId = 7) =>
     tools.browser_fill!.execute!({ fields, tabId }, { toolCallId: 'fill', messages: [] })
   return { cdp, tools, controller, run }
 }
@@ -24,74 +25,56 @@ function harness() {
 beforeEach(() => vi.useFakeTimers())
 afterEach(() => vi.useRealTimers())
 
-describe('multi-field fill', () => {
-  it('uses the existing typing path sequentially, then settles and snapshots just once', async () => {
+describe('verified multi-field fill tool', () => {
+  it('uses the shared mixed-field driver and snapshots once without a fixed delay/load wait', async () => {
     const h = harness()
-    const order: string[] = []
-    h.cdp.type.mockImplementation(async (_id, ref) => { order.push(ref) })
-    h.cdp.snapshot.mockImplementation(async () => { order.push('snapshot'); return { tabId: 7, title: 'Form', url: '', text: 'Alice Boston' } })
-    const result = h.run()
-    await vi.runAllTimersAsync()
-    expect(await result).toContain('Typing completed for 2/2 fields')
-    expect(order).toEqual(['e1', 'e2', 'snapshot'])
-    expect(h.cdp.type.mock.calls).toEqual([
-      [7, 'e1', 'Alice', { clear: true, signal: h.controller.signal }],
-      [7, 'e2', 'Boston', { clear: true, signal: h.controller.signal }],
-    ])
-    expect(h.cdp.waitForLoad).toHaveBeenCalledTimes(1)
+    const fields = [{ ref: 'e1', text: 'Alice' }, { ref: 'e2', select: 'No' }, { ref: 'e3', checked: false }]
+    const result = await h.run(fields)
+    expect(result).toContain('Verified 3/3 fields')
+    expect(h.cdp.fill).toHaveBeenCalledWith(7, fields, h.controller.signal)
+    expect(h.cdp.waitForLoad).not.toHaveBeenCalled()
     expect(h.cdp.snapshot).toHaveBeenCalledTimes(1)
-    expect(await result).toContain('Fresh browser observation')
+    expect(vi.getTimerCount()).toBe(0)
   })
 
-  it('stops on a detached field, identifies partial progress, and never replays earlier fields', async () => {
+  it('preserves partial progress and never retries', async () => {
     const h = harness()
-    h.cdp.type.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('No node with given id'))
-    const result = h.run([{ ref: 'e1', text: 'Alice' }, { ref: 'e2', text: 'Boston' }, { ref: 'e3', text: '02110' }])
-    await vi.runAllTimersAsync()
-    expect(await result).toContain('Typing completed for 1/3 fields')
-    expect(await result).toContain('Stopped at e2')
-    expect(await result).toContain('may be partially changed')
-    expect(await result).toContain('Not attempted: e3')
-    expect(h.cdp.type).toHaveBeenCalledTimes(2)
-    expect(h.cdp.snapshot).toHaveBeenCalledTimes(1)
+    h.cdp.fill.mockResolvedValueOnce({ ok: false, fields: [
+      { ref: 'e1', status: 'verified' }, { ref: 'e2', status: 'uncertain' }, { ref: 'e3', status: 'unattempted' },
+    ], stopped: 'Option missing' } as never)
+    const result = await h.run()
+    expect(result).toContain('Error: Form fill stopped.')
+    expect(result).toContain('e2: uncertain')
+    expect(result).toContain('e3: unattempted')
+    expect(result).toContain('No actions were replayed')
+    expect(h.cdp.fill).toHaveBeenCalledTimes(1)
   })
 
-  it('stops immediately after cancellation and does not snapshot or type the next field', async () => {
+  it('does not snapshot after cancellation', async () => {
     const h = harness()
-    h.cdp.type.mockImplementationOnce(async () => { h.controller.abort() })
+    h.cdp.fill.mockImplementationOnce(async () => { h.controller.abort(); throw new DOMException('Cancelled', 'AbortError') })
     await expect(h.run()).rejects.toMatchObject({ name: 'AbortError' })
-    expect(h.cdp.type).toHaveBeenCalledTimes(1)
     expect(h.cdp.snapshot).not.toHaveBeenCalled()
   })
 
-  it('preserves explicit append behavior and empty text', async () => {
-    const h = harness()
-    const run = h.tools.browser_fill!.execute!({ fields: [{ ref: 'e1', text: '', clear: false }] }, { toolCallId: 'fill', messages: [] })
-    await vi.runAllTimersAsync()
-    await run
-    expect(h.cdp.type).toHaveBeenCalledWith(7, 'e1', '', { clear: false, signal: h.controller.signal })
-  })
-
-  it('reports snapshot failures without repeating the fill', async () => {
+  it('reports snapshot failure without repeating verified writes', async () => {
     const h = harness()
     h.cdp.snapshot.mockRejectedValue(new Error('renderer unavailable'))
-    const result = h.run()
-    await vi.runAllTimersAsync()
-    expect(await result).toContain('Typing completed for 2/2 fields')
-    expect(await result).toContain('Automatic snapshot failed')
-    expect(h.cdp.type).toHaveBeenCalledTimes(2)
+    expect(await h.run()).toContain('Automatic snapshot failed')
+    expect(h.cdp.fill).toHaveBeenCalledTimes(1)
   })
 
-  it('rejects out-of-scope tabs before any typing', async () => {
+  it('rejects out-of-scope tabs before filling', async () => {
     const h = harness()
     expect(await h.run(undefined, 8)).toContain('out of this subagent')
-    expect(h.cdp.type).not.toHaveBeenCalled()
+    expect(h.cdp.fill).not.toHaveBeenCalled()
   })
 
-  it('rejects duplicate refs and empty batches at the tool boundary', () => {
+  it('accepts compatible text calls and rejects ambiguous intentions and duplicate refs', () => {
     const { tools } = harness()
     const schema = tools.browser_fill!.inputSchema as z.ZodType
-    expect(schema.safeParse({ fields: [] }).success).toBe(false)
-    expect(schema.safeParse({ fields: [{ ref: 'e1', text: 'a' }, { ref: 'e1', text: 'b' }] }).success).toBe(false)
+    expect(schema.safeParse({ fields: [{ ref: 'e1', text: '', clear: false }] }).success).toBe(true)
+    for (const fields of [[], [{ ref: 'e1', text: 'a', select: 'Yes' }], [{ ref: 'e1', checked: false, clear: true }],
+      [{ ref: 'e1', text: 'a' }, { ref: 'e1', select: 'No' }]]) expect(schema.safeParse({ fields }).success).toBe(false)
   })
 })

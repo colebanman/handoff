@@ -54,8 +54,6 @@ return await api.extensions.publish({draftId:draft.draftId, expectedRevision:0})
 
 Schema fields: `type` is object/array/string/number/boolean/null; optional `properties`, `required`, `items`, `enum`. Export paths can be dotted, such as `api.searchModules` and `browser.showAnnouncement`. Effects are `local`, `read`, `browser`, or `write`; these are descriptive, not an arbitrary-code read-only sandbox. Browser effects need a matching live tab. Bind targets explicitly when multiple accounts/sites are plausible. Read/write methods without a tab must use an explicit known origin; never guess another account.
 
-When the user enables experimental TypeSafe, the harness may invoke familiar published `read`/`local` actions before the first model step. Eligibility requires passing tests (live for `read`), a matching HTTP(S) tab for reads, and inputs whose required fields are enums/booleans or absent. Open-ended required inputs and browser/write effects stay with the agent. Describe defaults and purpose accurately; use enums only for genuinely closed sets, never hard-code changing course IDs or dates just to qualify. Results are delivered as ordinary tool results: use them without repeating the call. TypeSafe extraction checks still need original source evidence, not a function's unsupported summary.
-
 Matching metadata:
 
 - `sites`: host/path globs, e.g. `school.instructure.com/**` or an exact custom domain. Scheme/port matter when specified; paths are case-sensitive. These also validate bound tabs.
