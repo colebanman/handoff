@@ -4,12 +4,14 @@ import { createMemoryHost } from './memory-host'
 import { MemoryDatabase } from '../storage/continuity'
 import { DEFAULT_SETTINGS, type VirtualFileSystemService } from '../shared/types'
 import { memoryContentSchema, type MemoryEvent } from '../shared/continuity'
-import { memoryRuntime } from '../agent/continuity-context'
+import { memoryRuntime, selectMemories } from '../agent/continuity-context'
+import { formatMemory, MEMORY_PATH } from '../agent/memory'
+import { formatSiteMemory, SITE_MEMORY_PATH } from '../agent/site-memory'
 import type { observeMemory } from '../agent/memory-observer'
 
 let clock = Date.parse('2026-10-06T12:00:00Z')
 const hosts: ReturnType<typeof createMemoryHost>[] = []
-function setup(infer: typeof observeMemory = async () => ({ patch: { upserts: [], forget: [] }, tokens: 100 })) {
+function setup(infer: typeof observeMemory = async () => ({ patch: { upserts: [], forget: [] }, tokens: 100 }), vfs?: VirtualFileSystemService) {
   const listeners = new Set<(changes: Record<string, chrome.storage.StorageChange>, area: string) => void>()
   const stored: Record<string, unknown> = {}
   vi.stubGlobal('BroadcastChannel', undefined)
@@ -28,7 +30,7 @@ function setup(infer: typeof observeMemory = async () => ({ patch: { upserts: []
   const host = createMemoryHost({ database: db, now: () => clock, infer, busy: () => busy,
     settings: async () => ({ ...DEFAULT_SETTINGS, provider: 'openai', openaiAuthMode: 'api-key', apiKey: 'test' }),
     chats: async () => [], chat: async () => undefined,
-    vfs: { getEntry: async () => undefined } as unknown as VirtualFileSystemService,
+    vfs: vfs ?? { getEntry: async () => undefined } as unknown as VirtualFileSystemService,
   })
   hosts.push(host)
   const command = (payload: unknown) => host.handleRuntimeMessage({ target: 'background', type: 'memory.command', payload })!
@@ -38,6 +40,25 @@ const event = (text = 'Assigned to group 5.'): MemoryEvent => ({ id: 'source', p
 afterEach(async () => { for (const host of hosts.splice(0)) await host.dispose(); vi.unstubAllGlobals() })
 
 describe('background memory lifecycle', () => {
+  it('recalls migrated project context through its related site without a foreground inference request', async () => {
+    const files = new Map([
+      [MEMORY_PATH, formatMemory([{ title: '[Current] Redwood project context', body: 'The Redwood project uses this workspace for an active study.', date: '2026-10-06' }])],
+      [SITE_MEMORY_PATH, formatSiteMemory([{ title: 'Redwood project guide', body: 'Read the current project page.', scopes: ['school.example/courses/42/**'], date: '2026-10-06' }])],
+    ])
+    const vfs = {
+      getEntry: async (path: string) => files.has(path) ? { updatedAt: clock, size: files.get(path)!.length } : undefined,
+      readText: async (path: string) => ({ text: files.get(path) ?? '' }),
+    } as unknown as VirtualFileSystemService
+    const infer = vi.fn<typeof observeMemory>(async () => ({ patch: { upserts: [], forget: [] }, tokens: 0 }))
+    const { host, db } = setup(infer, vfs)
+    await host.ready
+    const records = (await db.snapshot()).records
+    const recalled = selectMemories(records, { task: 'What about this page?', urls: ['https://school.example/courses/42/work'], now: clock })
+    expect(recalled.map(record => record.title)).toEqual(expect.arrayContaining(['Redwood project guide', '[Current] Redwood project context']))
+    expect(records.every(record => typeof record.sources[0]?.fingerprint === 'string')).toBe(true)
+    expect(infer).not.toHaveBeenCalled()
+    expect(selectMemories(records, { task: 'What about this page?', urls: ['https://unrelated.example/'], now: clock })).toEqual([])
+  })
   it('serves prepared context synchronously and makes no inference call on inspection or foreground work', async () => {
     const infer = vi.fn<typeof observeMemory>(async () => ({ patch: { upserts: [], forget: [] }, tokens: 0 }))
     const { host, command, setBusy } = setup(infer)

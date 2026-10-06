@@ -48,11 +48,13 @@ export interface MemorySource {
   origin: 'human' | 'assistant' | 'tool' | 'automation' | 'artifact' | 'legacy' | 'unknown'
   at: number
   timeBasis?: 'event' | 'turn' | 'chat'
+  timeZone?: string
   label: string
   excerpt: string
   outcome?: 'success' | 'failure' | 'unknown'
   harnessVersion?: string
   savedContext?: boolean
+  fingerprint?: string
 }
 export interface MemoryRecord extends MemoryContent {
   id: string
@@ -94,6 +96,7 @@ export interface MemoryState {
   pausedAt?: number
   excludedPeriods: Array<{ from: number; until: number }>
   legacyImported: boolean
+  reviewedLegacy: string[]
   backfillComplete: boolean
   backfillAfter?: { at: number; id: string }
   lastRunAt?: number
@@ -107,7 +110,7 @@ export interface MemoryState {
 }
 export const newMemoryState = (): MemoryState => ({
   key: 'state', version: 0, privacyVersion: 0, config: { ...DEFAULT_MEMORY_CONFIG }, suppressions: [], deletedChats: [], retractedParents: [], supersededEvents: [],
-  ignoredBefore: 0, excludedPeriods: [], legacyImported: false, backfillComplete: false, usageDay: '', usedTokens: 0, batches: 0,
+  ignoredBefore: 0, excludedPeriods: [], legacyImported: false, reviewedLegacy: [], backfillComplete: false, usageDay: '', usedTokens: 0, batches: 0,
 })
 export interface MemorySnapshot { records: MemoryRecord[]; state: MemoryState; pending: number }
 

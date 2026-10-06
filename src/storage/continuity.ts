@@ -182,7 +182,7 @@ export class MemoryDatabase {
     }
   }
 
-  async commit(patch: MemoryPatch, events: MemoryEvent[], expectedVersion: number, now: number, dream = false): Promise<void> {
+  async commit(patch: MemoryPatch, events: MemoryEvent[], expectedVersion: number, now: number, dream = false, reviewedLegacy: string[] = []): Promise<void> {
     await this.transaction('readwrite', async (tx) => {
       const state = await this.state(tx)
       if (state.version !== expectedVersion || !state.config.learning) throw new MemoryConflict()
@@ -233,6 +233,7 @@ export class MemoryDatabase {
       }
       state.version++; state.lastRunAt = now; state.running = undefined; state.error = undefined; state.nextRunAt = undefined; state.batches++
       if (dream) state.lastDreamAt = now
+      state.reviewedLegacy = [...new Set([...state.reviewedLegacy, ...reviewedLegacy])]
       tx.objectStore('meta').put(state)
     })
   }
@@ -257,7 +258,7 @@ export class MemoryDatabase {
         if (state.ignoredBefore || state.suppressions.some((s) => s.subject === subjectKey(record.subject) || record.sources.some((source) => s.sourceIds.includes(source.id)))) continue
         const previous = records.find((r) => r.id === record.id)
         if (previous?.edited) continue
-        if (previous && previous.sources.some((s) => s.path === path && s.excerpt === record.sources[0]?.excerpt)) continue
+        if (previous && previous.sources.some((s) => s.path === path && (s.fingerprint ? s.fingerprint === record.sources[0]?.fingerprint : s.excerpt === record.sources[0]?.excerpt))) continue
         store.put(previous ? makeRecord(memoryContentSchema.parse(Object.fromEntries(Object.keys(memoryContentSchema.shape).map((k) => [k, record[k as keyof MemoryRecord]]))), record.sources, now, previous) : record)
         changed = true
       }

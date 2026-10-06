@@ -11,7 +11,7 @@ import { loadSettings } from '../storage/settings'
 import { subscribeVfsChanges } from '../storage/vfs-changes'
 import { MEMORY_PATH, parseMemory } from '../agent/memory'
 import { SITE_MEMORY_PATH, parseSiteMemory } from '../agent/site-memory'
-import { extractMemoryEvents, memoryParent } from '../agent/memory-evidence'
+import { extractMemoryEvents, memoryParent, memoryEvidenceText } from '../agent/memory-evidence'
 import { installMemoryRuntime, warmMemoryIndex, type MemoryRuntime } from '../agent/continuity-context'
 import { MEMORY_OBSERVER_PROMPT, memoryObserverInput, observeMemory } from '../agent/memory-observer'
 import { warmMemoryTokenizer, memoryTokens } from '../agent/memory-budget'
@@ -66,12 +66,14 @@ export function createMemoryHost(deps: MemoryHostDeps) {
       const key = `${path}:${subjectKey(item.title)}`
       const id = `legacy-${(await memoryHash(key)).slice(0, 32)}`
       const source: MemorySource = { id, path, at: Date.parse(item.date) || entry.updatedAt,
-        origin: 'legacy', label: path, excerpt: item.body }
+        origin: 'legacy', label: path, excerpt: memoryEvidenceText(item.body), fingerprint: await memoryHash(memoryEvidenceText(item)) }
+      const savedTriggers = 'triggers' in item && Array.isArray(item.triggers)
+        ? item.triggers.filter((cue): cue is string => typeof cue === 'string') : []
       const content = normalizeContent(memoryContentSchema.parse({
         subject: item.title.replace(/^\[(Stable|Current)\]\s*/i, ''), title: item.title, body: item.body || 'Saved context',
         kind: 'guide' in item && item.guide ? 'procedure' : 'context', useWhen: `When working on ${item.title.replace(/^\[.*?\]\s*/, '')}`,
         global: path === MEMORY_PATH && /^\[Stable\]/i.test(item.title),
-        scopes: 'scopes' in item ? item.scopes : [], triggers: 'triggers' in item ? item.triggers ?? [] : [item.title.replace(/^\[.*?\]\s*/, '')],
+        scopes: 'scopes' in item ? item.scopes : [], triggers: [...new Set([...savedTriggers, ...legacyCues(item.title, item.body)])].slice(0, 12),
         guide: 'guide' in item ? item.guide : undefined,
       }), now())
       return { ...makeRecord(content, [source], source.at), id }
@@ -81,7 +83,9 @@ export function createMemoryHost(deps: MemoryHostDeps) {
   const ready = (async () => {
     await warmMemoryTokenizer()
     cache = await db.snapshot()
-    if (!cache.state.legacyImported) await db.seed([...(await legacy(MEMORY_PATH)), ...(await legacy(SITE_MEMORY_PATH))])
+    const legacyRecords = connectLegacy([...(await legacy(MEMORY_PATH)), ...(await legacy(SITE_MEMORY_PATH))])
+    if (!cache.state.legacyImported) await db.seed(legacyRecords)
+    else for (const path of [MEMORY_PATH, SITE_MEMORY_PATH]) await db.syncLegacy(path, legacyRecords.filter((r) => r.sources[0]?.path === path), now())
     await db.updateState((s) => { s.running = undefined })
     await refresh()
     await arm(5_000)
@@ -150,11 +154,13 @@ export function createMemoryHost(deps: MemoryHostDeps) {
     if (cache.state.nextRunAt && cache.state.nextRunAt > now()) { await arm(cache.state.nextRunAt - now()); return }
     await backfill()
     if (deps.busy() || !cache?.state.config.learning) { await arm(); return }
-    const events = await db.pending(36_000, now())
-    const dream = !events.length && cache.records.length > 1 && (cache.state.lastRunAt ?? 0) > (cache.state.lastDreamAt ?? 0) && now() - (cache.state.lastRunAt ?? 0) >= 10 * 60_000
+    let events = await db.pending(36_000, now())
+    const legacyBatch = events.some((e) => e.at > now() - 30 * 60_000) ? [] : cache.records.filter((r) => !r.edited && r.sources.some((s) => s.origin === 'legacy') && !cache!.state.reviewedLegacy.includes(r.id)).slice(0, 12)
+    if (legacyBatch.length) events = []
+    const dream = !!legacyBatch.length || (!events.length && cache.records.length > 1 && (cache.state.lastRunAt ?? 0) > (cache.state.lastDreamAt ?? 0) && now() - (cache.state.lastRunAt ?? 0) >= 10 * 60_000)
     if (!events.length && !dream) { await arm(10 * 60_000); return }
     const state = cache.state
-    const input = memoryObserverInput(events, cache.records, state, now(), dream)
+    const input = memoryObserverInput(events, legacyBatch.length ? legacyBatch : cache.records, state, now(), dream)
     // Reservation includes bounded output; failed/aborted calls keep their reservation because they may have been billed.
     const reserve = memoryTokens(input + MEMORY_OBSERVER_PROMPT, state.config.model) + 8_000
     const day = new Date(now()).toISOString().slice(0, 10)
@@ -172,7 +178,7 @@ export function createMemoryHost(deps: MemoryHostDeps) {
       const settings = await (deps.settings ?? loadSettings)()
       const result = await infer(settings, state, input, AbortSignal.any([controller.signal, AbortSignal.timeout(90_000)]))
       if (controller.signal.aborted) throw controller.signal.reason
-      await serialize(() => db.commit(result.patch, events, state.version, now(), dream))
+      await serialize(() => db.commit(result.patch, events, state.version, now(), dream, legacyBatch.map((r) => r.id)))
       await db.updateState((s) => { s.usedTokens = Math.max(0, s.usedTokens - reserve + Math.max(0, result.tokens || reserve)) })
     } catch (error) {
       const interrupted = controller.signal.aborted || error instanceof MemoryConflict
@@ -209,7 +215,7 @@ export function createMemoryHost(deps: MemoryHostDeps) {
       const record: ChatRecord = { id: chatId, title: value.toolName, createdAt: at, updatedAt: at, modelId: '', messages: [], transcript: [{
         kind: 'tool', ...value, inputText: '', status: value.failed ? 'error' : 'done', at, harnessVersion: HARNESS_VERSION,
       }] }
-      await db.capture(await extractMemoryEvents(record))
+      await db.capture((await extractMemoryEvents(record)).map((event) => ({ ...event, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone })))
       await arm()
     },
     captureSpill: async (chatId, toolName, path, text) => {
@@ -219,7 +225,7 @@ export function createMemoryHost(deps: MemoryHostDeps) {
       const record: ChatRecord = { id: chatId, title: `Full ${toolName} result`, createdAt: at, updatedAt: at, modelId: '', messages: [], transcript: [{
         kind: 'tool', id: `spill:${path}`, agentId: 'main', toolName, inputText: '', output: text, status: 'done', at, harnessVersion: HARNESS_VERSION,
       }] }
-      const events = (await extractMemoryEvents(record)).map((e) => ({ ...e, path, outcome: 'unknown' as const }))
+      const events = (await extractMemoryEvents(record)).map((e) => ({ ...e, path, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, outcome: 'unknown' as const }))
       await db.capture(events)
       await arm()
     },
@@ -261,7 +267,7 @@ export function createMemoryHost(deps: MemoryHostDeps) {
   chrome.storage.onChanged.addListener(storage)
   const unwatch = subscribeVfsChanges((change) => {
     if (![MEMORY_PATH, SITE_MEMORY_PATH].includes(change.path)) return
-    void serialize(async () => { await ready; await db.syncLegacy(change.path, await legacy(change.path), now()); await refresh() }).catch(report)
+    void serialize(async () => { await ready; await db.syncLegacy(change.path, connectLegacy([...(await legacy(change.path)), ...(cache?.records.filter((r) => r.sources[0]?.path !== change.path) ?? [])]).filter((r) => r.sources[0]?.path === change.path), now()); await refresh() }).catch(report)
   })
 
   return {
@@ -315,5 +321,20 @@ export function createMemoryHost(deps: MemoryHostDeps) {
 }
 
 function safeError(error: unknown): string {
+  if (error instanceof SyntaxError || (error instanceof Error && error.name === 'ZodError')) return 'A memory update could not be validated. Existing memories are unchanged; learning will retry.'
   return redactSecrets(error instanceof Error ? error.message : String(error)).slice(0, 400)
+}
+
+const CUE_NOISE = new Set(['current', 'stable', 'context', 'memory', 'user', 'with', 'from', 'this', 'that', 'default', 'defaults', 'canonical', 'workspace', 'artifacts', 'guide', 'plan', 'master', 'list', 'data', 'file', 'json', 'html', 'read', 'services', 'explicitly', 'requests', 'remembering', 'full', 'email', 'mail', 'project', 'group', 'work', 'school', 'assignment', 'browser', 'website', 'page', 'tab', 'site', 'uses', 'active', 'study'])
+function legacyCues(title: string, body: string): string[] {
+  return [...new Set((`${title} ${body}`.toLowerCase().match(/[\p{L}][\p{L}\p{N}]{3,}/gu) ?? []).filter((word) => !CUE_NOISE.has(word)))].slice(0, 12)
+}
+function connectLegacy(records: MemoryRecord[]): MemoryRecord[] {
+  const sites = records.filter((r) => r.scopes.length)
+  return records.map((record) => {
+    if (record.scopes.length || record.global || record.relatedTo.length) return record
+    const terms = legacyCues(record.title, '').map((term) => term.replace(/s$/, ''))
+    const related = sites.filter((site) => legacyCues(site.title, '').some((term) => terms.includes(term.replace(/s$/, '')))).slice(0, 4)
+    return { ...record, relatedTo: related.map((r) => subjectKey(r.id)) }
+  })
 }

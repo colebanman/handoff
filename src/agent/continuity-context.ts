@@ -31,7 +31,7 @@ export interface MemoryQuery {
   deadline?: number
   guides?: Map<string, { updatedAt: number; size: number }>
 }
-const GENERIC = new Set(['email', 'mail', 'project', 'group', 'work', 'school', 'user', 'assignment', 'browser', 'website'])
+const GENERIC = new Set(['email', 'mail', 'project', 'group', 'work', 'school', 'user', 'assignment', 'browser', 'website', 'page', 'tab', 'site', 'context', 'guide', 'file', 'data'])
 const NOISE = new Set(['this', 'that', 'with', 'what', 'when', 'where', 'which', 'from', 'have', 'please', 'would', 'could', 'should', 'about', 'your', 'there', 'their', 'them', 'some', 'today', 'tonight', 'text'])
 const words = (text: string) => text.toLowerCase().match(/[\p{L}\p{N}_]{3,}/gu)?.filter((w) => !NOISE.has(w) && !GENERIC.has(w)) ?? []
 interface RecallIndex { words: Map<string, Set<MemoryRecord>>; hosts: Map<string, Set<MemoryRecord>>; fallback: Set<MemoryRecord>; global: MemoryRecord[] }
@@ -81,7 +81,7 @@ export function selectMemories(records: readonly MemoryRecord[], query: MemoryQu
     if (score) scored.push({ memory, score })
   }
   // One bounded relationship hop. Relationships are subject-scoped, never global authority.
-  const subjects = new Set(scored.filter((s) => s.score >= 100).map((s) => subjectKey(s.memory.subject)))
+  const subjects = new Set(scored.filter((s) => s.score >= 100).flatMap((s) => [subjectKey(s.memory.subject), subjectKey(s.memory.id)]))
   if (!query.isSubagent) for (const memory of records) {
     if (query.deadline !== undefined && performance.now() > query.deadline) break
     if (scored.some((s) => s.memory.id === memory.id) || !memory.relatedTo.some((s) => subjects.has(s))) continue

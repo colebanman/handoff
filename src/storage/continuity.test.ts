@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto'
 import { afterEach, describe, expect, it } from 'vitest'
-import { MemoryDatabase, MemoryConflict } from './continuity'
-import { memoryContentSchema, type MemoryEvent, type MemoryPatch } from '../shared/continuity'
+import { MemoryDatabase, MemoryConflict, makeRecord } from './continuity'
+import { memoryContentSchema, type MemoryEvent, type MemoryPatch, type MemoryState } from '../shared/continuity'
 
 const now = Date.parse('2026-10-06T12:00:00Z')
 const content = () => memoryContentSchema.parse({ subject: 'project.y.group', title: 'Project Y group', body: 'The user is in group 5.', kind: 'project', useWhen: 'When working on Project Y.', triggers: ['Project Y'], validUntil: '2026-10-20' })
@@ -12,6 +12,28 @@ function database() { const db = new MemoryDatabase(`memory-test-${crypto.random
 afterEach(async () => { for (const db of databases.splice(0)) await db.close() })
 
 describe('durable memory store', () => {
+  it('restores new review state on an older saved database without resetting privacy or spending', async () => {
+    const db = database()
+    await db.updateState(state => {
+      delete (state as Partial<MemoryState>).reviewedLegacy
+      state.privacyVersion = 7
+      state.usedTokens = 1234
+      state.config.learning = false
+    })
+    expect((await db.snapshot()).state).toMatchObject({ reviewedLegacy: [], privacyVersion: 7, usedTokens: 1234, config: { learning: false } })
+  })
+  it('refreshes legacy activation metadata when its body stays the same and records completed reviews', async () => {
+    const db = database()
+    const source = { id: 'legacy-source', path: '/workspace/SITES.md', at: now, origin: 'legacy' as const, label: 'Legacy guide', excerpt: 'Same useful body.', fingerprint: 'first-revision' }
+    const record = makeRecord({ ...content(), body: source.excerpt, scopes: ['old.example/project/**'] }, [source], now)
+    await db.seed([record])
+    const revised = { ...record, scopes: ['new.example/project/**'], sources: [{ ...source, fingerprint: 'second-revision' }] }
+    await db.syncLegacy(source.path, [revised], now + 1)
+    const snapshot = await db.snapshot()
+    expect(snapshot.records[0]).toMatchObject({ id: record.id, body: source.excerpt, scopes: ['new.example/project/**'], revision: 2 })
+    await db.commit({ upserts: [], forget: [] }, [], snapshot.state.version, now + 2, true, [record.id])
+    expect((await db.snapshot()).state.reviewedLegacy).toEqual([record.id])
+  })
   it('deduplicates source ingestion and atomically publishes memory with source acknowledgement', async () => {
     const db = database(), e = event('e1')
     expect(await db.capture([e])).toBe(1)

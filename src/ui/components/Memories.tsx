@@ -153,7 +153,7 @@ export function MemoriesPanel({ onClose }: { onClose: () => void }): React.React
 }
 
 function MemoryConnections({ record, records, onSelect }: { record: MemoryRecord; records: MemoryRecord[]; onSelect(id: string): void }) {
-  const linked = records.filter((r) => r.id !== record.id && (record.relatedTo.includes(subjectKey(r.subject)) || r.relatedTo.includes(subjectKey(record.subject)) || record.entities.some((entity) => r.entities.includes(entity)))).slice(0, 6)
+  const linked = records.filter((r) => r.id !== record.id && (record.relatedTo.includes(subjectKey(r.subject)) || record.relatedTo.includes(subjectKey(r.id)) || r.relatedTo.includes(subjectKey(record.subject)) || r.relatedTo.includes(subjectKey(record.id)) || record.entities.some((entity) => r.entities.includes(entity)))).slice(0, 6)
   if (!linked.length) return null
   return <div className="memory-connections"><span>Connected context</span><div>{linked.map((r) => <button key={r.id} type="button" onClick={() => onSelect(r.id)}><span aria-hidden="true">↳</span>{r.title}</button>)}</div></div>
 }
